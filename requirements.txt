@@ -13,3 +13,5 @@ bencodepy
 certifi
 urllib3
 setuptools
+Pillow
+python-libtorrent
