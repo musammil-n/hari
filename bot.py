@@ -6,7 +6,6 @@ import requests
 import io
 import re
 import time
-import subprocess
 from datetime import datetime
 from flask import Flask
 from pyrogram import Client, errors
@@ -16,7 +15,6 @@ import aiohttp
 import libtorrent as lt
 import os
 from PIL import Image
-import tempfile
 
 # ------------------ Keep-Alive URL ------------------
 KEEP_ALIVE_URL = "https://willowy-donny-kushpu-0e1a566f.koyeb.app/"
@@ -124,33 +122,33 @@ def is_valid_entry(entry):
             
     return True
 
-def generate_thumbnail(video_path, output_path, timestamp="00:00:10"):
-    """Generate thumbnail from video file using ffmpeg"""
+async def download_thumbnail():
+    """Download the thumbnail from the specified URL"""
+    thumbnail_url = "https://i.ibb.co/MDwd1f3D/6087047735061627461.jpg"
+    thumbnail_path = os.path.join(THUMBNAIL_DIR, "custom_thumb.jpg")
+    
+    # Check if thumbnail already exists
+    if os.path.exists(thumbnail_path):
+        return thumbnail_path
+    
     try:
-        cmd = [
-            'ffmpeg', '-i', video_path, '-ss', timestamp,
-            '-vframes', '1', '-an', '-vcodec', 'png',
-            '-f', 'rawvideo', '-s', '320x240', output_path, '-y'
-        ]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-        if result.returncode == 0 and os.path.exists(output_path):
-            # Resize and optimize thumbnail
-            with Image.open(output_path) as img:
-                img.thumbnail((320, 240), Image.Resampling.LANCZOS)
-                img.save(output_path, "JPEG", quality=85, optimize=True)
-            return output_path
-        else:
-            logging.warning(f"ffmpeg failed to generate thumbnail: {result.stderr}")
-            return None
-    except subprocess.TimeoutExpired:
-        logging.warning(f"ffmpeg timeout while generating thumbnail for {video_path}")
-        return None
+        async with aiohttp.ClientSession() as session:
+            async with session.get(thumbnail_url) as response:
+                if response.status == 200:
+                    content = await response.read()
+                    with open(thumbnail_path, 'wb') as f:
+                        f.write(content)
+                    logging.info(f"Thumbnail downloaded successfully to {thumbnail_path}")
+                    return thumbnail_path
+                else:
+                    logging.error(f"Failed to download thumbnail. Status: {response.status}")
+                    return None
     except Exception as e:
-        logging.error(f"Error generating thumbnail: {e}")
+        logging.error(f"Error downloading thumbnail: {e}")
         return None
 
 def create_default_thumbnail():
-    """Create a default thumbnail image"""
+    """Create a fallback thumbnail if download fails"""
     try:
         img = Image.new('RGB', (320, 240), color='black')
         # You could add text or logo here
@@ -210,6 +208,7 @@ class MN_Bot(Client):
         self.channel_id = CHANNEL.ID
         self.owner_id = OWNER.ID
         self.posted = set()
+        self.thumbnail_path = None  # Store thumbnail path
 
         self.ses = lt.session({'listen_interfaces': '0.0.0.0:6881'})
         self.ses.add_dht_router('router.bittorrent.com', 6881)
@@ -400,27 +399,20 @@ class MN_Bot(Client):
             # Add suffix to filename
             file_path = add_suffix_to_filename(file_path)
             
-            # Generate thumbnail for video files
-            thumbnail_path = None
-            file_ext = os.path.splitext(file_path)[1].lower()
-            video_extensions = ['.mp4', '.mkv', '.avi', '.mov', '.wmv', '.flv', '.webm', '.m4v']
-            
-            if file_ext in video_extensions:
-                thumbnail_name = f"{os.path.splitext(os.path.basename(file_path))[0]}_thumb.jpg"
-                thumbnail_path = os.path.join(THUMBNAIL_DIR, thumbnail_name)
-                
-                generated_thumb = generate_thumbnail(file_path, thumbnail_path)
-                if not generated_thumb:
-                    thumbnail_path = create_default_thumbnail()
+            # Use the downloaded custom thumbnail for all files
+            if not self.thumbnail_path:
+                self.thumbnail_path = await download_thumbnail()
+                if not self.thumbnail_path:
+                    self.thumbnail_path = create_default_thumbnail()
             
             logging.info(f"Uploading '{os.path.basename(file_path)}' ({largest_file['size'] / (1024*1024):.2f} MB) to channel as document...")
             
-            # Send as document with thumbnail (videos are sent as files, not video messages)
+            # Send as document with custom thumbnail (videos are sent as files, not video messages)
             await self.send_document(
                 chat_id=self.channel_id,
                 document=file_path,
                 caption=f"**{entry_title}**\n\n_Downloaded by bot._",
-                thumb=thumbnail_path if thumbnail_path and os.path.exists(thumbnail_path) else None,
+                thumb=self.thumbnail_path if self.thumbnail_path and os.path.exists(self.thumbnail_path) else None,
                 force_document=True
             )
             logging.info(f"Successfully uploaded '{os.path.basename(file_path)}' to channel as document.")
@@ -428,10 +420,6 @@ class MN_Bot(Client):
             # Clean up files
             os.remove(file_path)
             logging.info(f"Removed downloaded file: {file_path}")
-            
-            if thumbnail_path and os.path.exists(thumbnail_path) and "default_thumb.jpg" not in thumbnail_path:
-                os.remove(thumbnail_path)
-                logging.info(f"Removed thumbnail: {thumbnail_path}")
 
         except Exception as e:
             logging.error(f"Error sending downloaded file to channel for {entry_title}: {e}")
@@ -608,6 +596,11 @@ class MN_Bot(Client):
         me = await self.get_me()
         BOT.USERNAME = f"@{me.username}"
         
+        # Download thumbnail at startup
+        self.thumbnail_path = await download_thumbnail()
+        if not self.thumbnail_path:
+            self.thumbnail_path = create_default_thumbnail()
+            
         asyncio.create_task(keep_alive())
         asyncio.create_task(self._update_download_progress())
         
