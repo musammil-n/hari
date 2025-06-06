@@ -16,3 +16,4 @@ setuptools
 Pillow
 qbittorrent-api
 pymongo
+certifi
