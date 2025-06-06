@@ -14,9 +14,5 @@ certifi
 urllib3
 setuptools
 Pillow
-aria2p
+qbittorrent-api
 pymongo
-dnspython
-humanize
-asyncio-timeout
-psutil
