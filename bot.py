@@ -1,32 +1,114 @@
 import asyncio
 import feedparser
+import json
 import logging
-import threading
-import requests
-import io
-import re
-import time
-import subprocess
 import os
-import aiohttp
-from datetime import datetime
+import re
+import subprocess
+import sys
+import time
+import threading
+from datetime import datetime, timedelta
 from pathlib import Path
+from typing import Dict, List, Tuple, Optional
+from config import BOT, API, OWNER
+import aiohttp
+import aria2p
 from flask import Flask
 from PIL import Image
-from pyrogram import Client, errors, filters
-from pyrogram.types import Message
-from config import BOT, API, OWNER, CHANNEL
+from pymongo import MongoClient
+from pyrogram import Client, filters, idle, errors
 
 # ------------------ Constants ------------------
-KEEP_ALIVE_URL = "https://willowy-donny-kushpu-0e1a566f.koyeb.app/"
-PSA_FEEDS = ["https://bt4gprx.com/search?q=psa&page=rss"]
+KEEP_ALIVE_URL = "https://abundant-barbie-musammiln-db578527.koyeb.app/"
+PSA_FEEDS = ["https://bt4gprx.com/search?q=psa&page=rss"] # Your RSS feeds
 MAX_FILE_SIZE_MB = 1900
 DOWNLOAD_STATUS_UPDATE_INTERVAL = 10
 TELEGRAM_FILENAME_LIMIT = 60
 SUFFIX = " -@MNTGX.-"
 THUMBNAIL_URL = "https://i.ibb.co/MDwd1f3D/6087047735061627461.jpg"
-ARIA2_LOG_PATH = "aria2_debug.log"
-ARIA2_RPC_PORT = 6800
+MONGODB_URI = "mongodb+srv://mntgx:mntgx@cluster0.pzcpq.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0"
+
+# ------------------ Database Setup ------------------
+class MongoDB:
+    def __init__(self):
+        try:
+            self.client = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=5000)
+            self.db = self.client.torrent_bot
+            self.completed = self.db.completed
+            self.queue = self.db.queue
+            self.active = self.db.active
+            # Test connection
+            self.client.server_info()
+            logging.info("MongoDB connected successfully")
+        except Exception as e:
+            logging.error(f"MongoDB connection failed: {e}")
+
+    def add_to_queue(self, content: str, title: str):
+        try:
+            self.queue.insert_one({
+                "content": content,
+                "title": title,
+                "added_at": datetime.utcnow()
+            })
+        except Exception as e:
+            logging.error(f"Failed to add to queue: {e}")
+
+    def move_to_active(self, gid: str, content: str, title: str):
+        try:
+            self.queue.delete_one({"content": content})
+            self.active.insert_one({
+                "gid": gid,
+                "content": content,
+                "title": title,
+                "started_at": datetime.utcnow()
+            })
+        except Exception as e:
+            logging.error(f"Failed to move to active: {e}")
+
+    def move_to_completed(self, gid: str):
+        try:
+            active = self.active.find_one({"gid": gid})
+            if active:
+                self.active.delete_one({"gid": gid})
+                self.completed.insert_one({
+                    **active,
+                    "completed_at": datetime.utcnow()
+                })
+        except Exception as e:
+            logging.error(f"Failed to move to completed: {e}")
+
+    def get_queued_items(self):
+        try:
+            return list(self.queue.find())
+        except Exception as e:
+            logging.error(f"Failed to get queued items: {e}")
+            return []
+
+    def get_active_downloads(self):
+        try:
+            return list(self.active.find())
+        except Exception as e:
+            logging.error(f"Failed to get active downloads: {e}")
+            return []
+
+    def is_completed(self, content: str):
+        try:
+            return bool(self.completed.find_one({"content": content}))
+        except Exception as e:
+            logging.error(f"Failed to check completion: {e}")
+            return False
+
+    def cleanup_stale_active(self):
+        """Remove stale active downloads"""
+        try:
+            # Remove active downloads older than 24 hours
+            cutoff = datetime.utcnow() - timedelta(hours=24)
+            result = self.active.delete_many({"started_at": {"$lt": cutoff}})
+            if result.deleted_count > 0:
+                logging.info(f"Cleaned up {result.deleted_count} stale active downloads")
+        except Exception as e:
+            logging.error(f"Failed to cleanup stale active: {e}")
 
 # ------------------ Path Setup ------------------
 BASE_DIR = Path(__file__).parent
@@ -48,12 +130,19 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "Bot is running!"
+    return "Torrent Bot is running!"
+
+@app.route('/health')
+def health():
+    return {"status": "healthy", "timestamp": datetime.utcnow().isoformat()}
 
 def run_flask():
-    app.run(host='0.0.0.0', port=8000, debug=False, use_reloader=False)
+    try:
+        app.run(host='0.0.0.0', port=8000, debug=False, use_reloader=False)
+    except Exception as e:
+        logging.error(f"Flask server error: {e}")
 
-# ------------------ Utility Functions ------------------
+# ------------------ Missing Functions ------------------
 def fetch_feed(url):
     """Fetch RSS feed"""
     try:
@@ -88,16 +177,90 @@ def download_torrent_or_link(entry):
         logging.error(f"Failed to extract torrent link: {e}")
         return entry.link, 'link'
 
-def is_valid_entry(entry):
-    """Check if entry contains invalid keywords"""
+# ------------------ Aria2 Setup (with improvements) ------------------
+async def start_aria2():
+    """Start aria2 daemon"""
+    process = None
+    api = None
     try:
-        title = entry.title.lower()
-        return not any(keyword in title for keyword in [
-            "predvd", "prehd", "hdts", "camrip", "telesync", "screener", "ts", "dvdscr"
-        ])
+        # Check if killall exists before trying to use it
+        if os.path.exists("/usr/bin/killall") or os.path.exists("/bin/killall"):
+            try:
+                logging.info("Attempting to kill existing aria2 processes...")
+                subprocess.run(["killall", "-q", "aria2c"], check=False, timeout=5)
+                await asyncio.sleep(2)
+            except Exception as e:
+                logging.warning(f"Failed to kill existing aria2 processes (might not be running or killall not found): {e}")
+        else:
+            logging.warning("killall command not found. Cannot explicitly kill existing aria2 processes.")
+            try:
+                output = subprocess.check_output(["ps", "aux"]).decode()
+                for line in output.splitlines():
+                    if "aria2c" in line and "grep" not in line:
+                        pid = line.split()[1]
+                        logging.info(f"Found existing aria2c process (PID: {pid}). Attempting to kill it.")
+                        subprocess.run(["kill", "-9", pid], check=False, timeout=2)
+                        await asyncio.sleep(1)
+            except Exception as e:
+                logging.warning(f"Could not kill existing aria2c processes using 'ps' fallback: {e}. Ensure 'ps' is installed.")
+
+        aria2_log_path = BASE_DIR / "aria2_debug.log"
+        with open(aria2_log_path, "w") as log_file:
+            process = subprocess.Popen([
+                "aria2c",
+                "--enable-rpc",
+                "--rpc-listen-all=true",
+                "--rpc-listen-port=6800",
+                "--rpc-allow-origin-all=true",
+                f"--dir={DOWNLOAD_DIR}",
+                "--max-concurrent-downloads=2",
+                "--max-connection-per-server=8",
+                "--min-split-size=1M",
+                "--split=8",
+                "--bt-max-peers=50",
+                "--seed-time=0",
+                "--daemon=true",
+            ], stdout=subprocess.DEVNULL, stderr=log_file)
+
+        logging.info(f"Aria2 process started with PID: {process.pid}. Logs can be found in {aria2_log_path}")
+
+        await asyncio.sleep(7)
+        
+        for i in range(15):
+            try:
+                api = aria2p.API(aria2p.Client(host="http://localhost", port=6800, secret=""))
+                api.get_version()
+                logging.info("Aria2 started successfully and RPC is reachable.")
+                return process, api
+            except Exception as e:
+                logging.warning(f"Attempt {i+1}/15 to connect to aria2 failed: {e}. Checking if aria2 process is still alive.")
+                if process.poll() is not None:
+                    # Aria2 process unexpectedly exited, log the error and return None
+                    logging.error(f"Aria2 process unexpectedly exited with code {process.poll()}. Check {aria2_log_path} for errors.")
+                    return None, None # Return None to indicate failure, bot can still start
+                await asyncio.sleep(5)
+        
+        logging.error("Failed to connect to aria2 RPC after multiple attempts. Check logs and ensure aria2c is properly installed and configured.")
+        return None, None # Return None to indicate failure
+
     except Exception as e:
-        logging.error(f"Error checking entry validity: {e}")
-        return False
+        logging.error(f"Failed to start aria2 due to an unexpected error: {e}")
+        if process:
+            try:
+                process.terminate()
+            except Exception as term_e:
+                logging.error(f"Failed to terminate aria2 process: {term_e}")
+        return None, None
+
+# ------------------ Helper Functions ------------------
+def add_suffix(filename: str) -> str:
+    """Add suffix to filename while respecting Telegram limits"""
+    base, ext = os.path.splitext(filename)
+    new_base = f"{base}{SUFFIX}"
+    if len(new_base) + len(ext) > TELEGRAM_FILENAME_LIMIT:
+        max_base_len = TELEGRAM_FILENAME_LIMIT - len(ext) - len(SUFFIX)
+        new_base = f"{base[:max_base_len].rstrip()}{SUFFIX}"
+    return f"{new_base}{ext}"
 
 async def download_thumbnail() -> Optional[Path]:
     """Download thumbnail from URL"""
@@ -136,399 +299,605 @@ def create_default_thumbnail() -> Optional[Path]:
         logging.error(f"Failed to create default thumb: {e}")
         return None
 
-def add_suffix_to_filename(filename: str) -> str:
-    """Add suffix to filename while respecting Telegram limits"""
-    base, ext = os.path.splitext(filename)
-    new_base = f"{base}{SUFFIX}"
-    if len(new_base) + len(ext) > TELEGRAM_FILENAME_LIMIT:
-        max_base_len = TELEGRAM_FILENAME_LIMIT - len(ext) - len(SUFFIX)
-        new_base = f"{base[:max_base_len].rstrip()}{SUFFIX}"
-    return f"{new_base}{ext}"
-
-async def keep_alive():
-    """Keep the bot alive by pinging the Koyeb URL"""
-    while True:
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(KEEP_ALIVE_URL) as resp:
-                    logging.debug(f"Keep-alive ping: {resp.status}")
-        except Exception as e:
-            logging.warning(f"Keep-alive failed: {e}")
-        await asyncio.sleep(300)  # Ping every 5 minutes
-
-# ------------------ Aria2 Management ------------------
-async def start_aria2():
-    """Start aria2 daemon with retries"""
-    max_retries = 3
-    for attempt in range(1, max_retries + 1):
-        try:
-            # Kill existing aria2 processes
-            try:
-                subprocess.run(["pkill", "-f", "aria2c"], timeout=5, check=False)
-                await asyncio.sleep(2)
-            except Exception as e:
-                logging.warning(f"Error killing existing aria2: {e}")
-
-            # Start new process
-            cmd = [
-                "aria2c",
-                "--enable-rpc",
-                "--rpc-listen-all",
-                f"--rpc-listen-port={ARIA2_RPC_PORT}",
-                "--rpc-allow-origin-all",
-                f"--dir={DOWNLOAD_DIR}",
-                "--max-concurrent-downloads=2",
-                "--max-connection-per-server=8",
-                "--min-split-size=1M",
-                "--split=8",
-                "--bt-max-peers=50",
-                "--seed-time=0",
-                "--daemon=true",
-                f"--log={ARIA2_LOG_PATH}",
-                "--log-level=info"
-            ]
-            
-            logging.info(f"Starting aria2 (attempt {attempt}/{max_retries}): {' '.join(cmd)}")
-            process = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            await asyncio.sleep(5)  # Give it time to start
-
-            # Verify connection
-            try:
-                import aria2p
-                client = aria2p.Client(
-                    host="http://localhost",
-                    port=ARIA2_RPC_PORT,
-                    timeout=10
-                )
-                api = aria2p.API(client)
-                version = api.get_version()
-                logging.info(f"Aria2 started successfully. Version: {version.version}")
-                return process, api
-            except Exception as e:
-                logging.error(f"Aria2 RPC connection failed: {e}")
-                raise
-
-        except Exception as e:
-            logging.error(f"Aria2 startup attempt {attempt} failed: {e}")
-            if attempt < max_retries:
-                await asyncio.sleep(5)
-            else:
-                return None, None
+async def get_thumbnail() -> Optional[Path]:
+    """Get thumbnail (download or create default)"""
+    thumb = await download_thumbnail()
+    return thumb or create_default_thumbnail()
 
 # ------------------ Bot Class ------------------
-class MN_Bot(Client):
+class TorrentBot(Client):
     def __init__(self):
         super().__init__(
-            "MN-Bot",
+            "TorrentBot",
             api_id=API.ID,
             api_hash=API.HASH,
             bot_token=BOT.TOKEN,
             workers=8
         )
-        self.channel_id = CHANNEL.ID
         self.owner_id = OWNER.ID
-        self.posted = set()
-        self.thumbnail_path = None
-        self.active_downloads = {}  # {gid: download_info}
+        self.db = MongoDB()
         self.download_queue = asyncio.Queue()
-        self.aria2_process = None
+        self.active_downloads = {}
+        self.thumbnail_path = None
         self.aria2 = None
+        self.aria2_process = None
         self.running = False
 
-    async def ensure_aria2_connection(self):
-        """Ensure we have a working aria2 connection"""
-        if self.aria2:
-            try:
-                self.aria2.get_version()
-                return True
-            except Exception:
-                pass
-        
-        logging.warning("Aria2 connection lost, attempting to reconnect...")
-        self.aria2_process, self.aria2 = await start_aria2()
-        
-        if self.aria2:
-            await self.send_message(
-                self.owner_id,
-                "♻️ Reconnected to Aria2 successfully"
-            )
-            return True
-        else:
-            await self.send_message(
-                self.owner_id,
-                "❌ Failed to reconnect to Aria2. Downloads will not work."
-            )
-            return False
-
-    async def _add_torrent_to_session(self, content: str, title: str):
-        """Add torrent/magnet to aria2"""
-        if not await self.ensure_aria2_connection():
-            return None
-
+    async def _rename_with_suffix(self, file_path: Path) -> Path:
+        """Rename file with suffix"""
         try:
-            if content.startswith('magnet:'):
-                download = self.aria2.add_magnet(content, {"dir": str(DOWNLOAD_DIR)})
-            else:
-                download = self.aria2.add_uri([content], {"dir": str(DOWNLOAD_DIR)})
+            new_name = add_suffix(file_path.name)
+            new_path = file_path.with_name(new_name)
+            if file_path.exists():
+                file_path.rename(new_path)
+            return new_path
+        except Exception as e:
+            logging.error(f"Renaming failed for {file_path.name}: {e}")
+            return file_path
+
+    async def _get_largest_file(self, download) -> Optional[Path]:
+        """Get the largest file from download"""
+        try:
+            if not download.files:
+                logging.warning(f"No files found for download GID: {download.gid}")
+                return None
             
-            # Create status message
-            msg = await self.send_message(
-                self.owner_id,
-                f"📥 **Download Started**\n"
-                f"📁 {title[:50]}{'...' if len(title) > 50 else ''}\n"
-                f"🆔 GID: `{download.gid}`"
-            )
+            largest_file = max(download.files, key=lambda f: f.length)
+            file_path = Path(largest_file.path)
             
-            self.active_downloads[download.gid] = {
-                'title': title,
-                'content': content,
-                'message': msg,
-                'start_time': time.time(),
-                'last_update': time.time()
-            }
+            if file_path.exists() and file_path.stat().st_size > 1024:
+                return file_path
             
-            logging.info(f"Started download: {title} (GID: {download.gid})")
-            return download.gid
+            # Fallback if largest file is not found/valid for some reason
+            for file in download.files:
+                file_path = Path(file.path)
+                if file_path.exists() and file_path.stat().st_size > 1024:
+                    logging.info(f"Using alternate file {file_path.name} as largest was not found/valid.")
+                    return file_path
+            
+            logging.warning(f"No valid downloadable file found for GID: {download.gid}")
+            return None
             
         except Exception as e:
-            logging.error(f"Download start failed for '{title}': {e}")
-            await self.send_message(
-                self.owner_id,
-                f"❌ **Download Failed to Start**\n"
-                f"📁 {title[:50]}{'...' if len(title) > 50 else ''}\n"
-                f"🚫 Error: {str(e)[:100]}"
-            )
+            logging.error(f"Error getting largest file for {download.gid}: {e}")
             return None
-
-    async def _update_download_progress(self):
-        """Monitor active downloads"""
-        while self.running:
-            try:
-                if not await self.ensure_aria2_connection():
-                    await asyncio.sleep(30)
-                    continue
-
-                await asyncio.sleep(DOWNLOAD_STATUS_UPDATE_INTERVAL)
-                
-                for gid in list(self.active_downloads.keys()):
-                    if not self.running:
-                        break
-                        
-                    try:
-                        download = self.aria2.get_download(gid)
-                        data = self.active_downloads[gid]
-                        
-                        if download.is_complete:
-                            if await self._upload_file(download):
-                                await data['message'].edit_text(
-                                    f"✅ **Download Complete**\n"
-                                    f"📁 {data['title'][:50]}{'...' if len(data['title']) > 50 else ''}"
-                                )
-                            del self.active_downloads[gid]
-                            
-                        elif download.status == "error":
-                            error_msg = download.error_message or "Unknown error"
-                            await data['message'].edit_text(
-                                f"❌ **Download Failed**\n"
-                                f"📁 {data['title'][:50]}{'...' if len(data['title']) > 50 else ''}\n"
-                                f"🚫 Error: {error_msg[:100]}"
-                            )
-                            del self.active_downloads[gid]
-                            
-                        elif download.is_active:
-                            # Update progress
-                            progress = download.progress
-                            speed = download.download_speed / 1024  # KB/s
-                            downloaded = download.completed_length / (1024 * 1024)  # MB
-                            total = download.total_length / (1024 * 1024)  # MB
-                            
-                            if time.time() - data['last_update'] > DOWNLOAD_STATUS_UPDATE_INTERVAL:
-                                await data['message'].edit_text(
-                                    f"⏳ **Downloading** ({progress:.1f}%)\n"
-                                    f"📁 {data['title'][:50]}{'...' if len(data['title']) > 50 else ''}\n"
-                                    f"📊 {downloaded:.1f}MB / {total:.1f}MB\n"
-                                    f"⚡ {speed:.1f} KB/s"
-                                )
-                                data['last_update'] = time.time()
-                                
-                    except aria2p.client.ClientException as e:
-                        if "not found" in str(e).lower():
-                            logging.info(f"Download {gid} not found, cleaning up")
-                            del self.active_downloads[gid]
-                        else:
-                            logging.error(f"Aria2 client error for {gid}: {e}")
-                            self.aria2 = None  # Force reconnect
-                            break
-                            
-                    except Exception as e:
-                        logging.error(f"Error monitoring {gid}: {e}")
-                        continue
-                        
-            except Exception as e:
-                logging.error(f"Monitor loop error: {e}")
-                await asyncio.sleep(30)
 
     async def _upload_file(self, download):
         """Upload completed file to Telegram"""
         try:
-            # Find the largest downloaded file
-            largest_file = None
-            for file in download.files:
-                file_path = Path(file.path)
-                if file_path.exists() and file_path.stat().st_size > 0:
-                    if not largest_file or file.length > largest_file.length:
-                        largest_file = file
-            
-            if not largest_file:
-                logging.error(f"No valid files found for {download.name}")
+            file_path = await self._get_largest_file(download)
+            if not file_path:
+                logging.error(f"Upload failed for GID {download.gid}: No valid downloaded file found.")
+                await self.send_message(
+                    self.owner_id,
+                    f"❌ **Upload Failed**\n"
+                    f"📁 File: {getattr(download, 'name', 'Unknown')}\n"
+                    f"🚫 Error: No valid file found after download. Check logs for details."
+                )
                 return False
-                
-            file_path = Path(largest_file.path)
-            if file_path.stat().st_size > MAX_FILE_SIZE_MB * 1024 * 1024:
-                logging.error(f"File too large: {file_path}")
-                return False
-                
-            # Rename file
-            new_path = file_path.with_name(add_suffix_to_filename(file_path.name))
-            file_path.rename(new_path)
             
-            # Get thumbnail
+            file_size = file_path.stat().st_size
+            if file_size > MAX_FILE_SIZE_MB * 1024 * 1024:
+                logging.error(f"Upload failed for GID {download.gid}: File too large ({file_size / (1024*1024):.2f}MB).")
+                await self.send_message(
+                    self.owner_id,
+                    f"❌ **Upload Failed**\n"
+                    f"📁 File: {file_path.name}\n"
+                    f"🚫 Error: File size ({file_size / (1024*1024):.2f}MB) exceeds Telegram limit ({MAX_FILE_SIZE_MB}MB). Check logs for details."
+                )
+                return False
+            
+            if file_size < 1024:
+                logging.error(f"Upload failed for GID {download.gid}: File too small ({file_size} bytes).")
+                await self.send_message(
+                    self.owner_id,
+                    f"❌ **Upload Failed**\n"
+                    f"📁 File: {file_path.name}\n"
+                    f"🚫 Error: File is too small ({file_size} bytes), possibly corrupted. Check logs for details."
+                )
+                return False
+            
+            file_path = await self._rename_with_suffix(file_path)
+            
             if not self.thumbnail_path:
-                self.thumbnail_path = await download_thumbnail() or create_default_thumbnail()
+                self.thumbnail_path = await get_thumbnail()
             
-            # Upload
-            await self.send_document(
-                chat_id=self.channel_id,
-                document=str(new_path),
-                caption=f"**{download.name}**\n\n⚡ Powered by @MNTGX",
-                thumb=str(self.thumbnail_path) if self.thumbnail_path else None
+            caption = (
+                f"**{file_path.stem.replace(SUFFIX, '')}**\n\n"
+                f"📁 Size: {file_size / (1024*1024):.2f} MB\n"
+                f"🔗 Source: RSS Feed\n"
+                f"⚡ Powered by @MNTGX"
             )
             
-            # Cleanup
-            new_path.unlink()
+            logging.info(f"Attempting to upload {file_path.name} to Telegram (Chat ID: {self.owner_id})...")
+            await self.send_document(
+                chat_id=self.owner_id,
+                document=str(file_path),
+                caption=caption,
+                thumb=str(self.thumbnail_path) if self.thumbnail_path else None,
+                progress=self._upload_progress
+            )
+            logging.info(f"Successfully uploaded {file_path.name}")
+            
+            try:
+                file_path.unlink()
+                if file_path.parent != DOWNLOAD_DIR and not any(file_path.parent.iterdir()):
+                    file_path.parent.rmdir()
+                    logging.info(f"Removed empty directory: {file_path.parent}")
+            except Exception as cleanup_e:
+                logging.warning(f"Failed to clean up file {file_path} or its directory: {cleanup_e}")
+            
+            self.db.move_to_completed(download.gid)
             return True
             
         except Exception as e:
-            logging.error(f"Upload failed for {download.name}: {e}")
+            logging.error(f"Upload failed for GID {download.gid}: {e}")
+            await self.send_message(
+                self.owner_id,
+                f"❌ **Upload Failed**\n"
+                f"📁 File: {getattr(download, 'name', 'Unknown')}\n"
+                f"🚫 Error: An unexpected error occurred during upload. Check logs for details."
+            )
             return False
 
+    async def _upload_progress(self, current, total):
+        """Upload progress callback"""
+        try:
+            percent = current * 100 / total
+            # Log progress less frequently to avoid spamming logs, especially during large uploads
+            if int(percent) % 20 == 0 or percent == 100 or percent == 0:
+                if not hasattr(self, '_last_logged_upload_percent'):
+                    self._last_logged_upload_percent = -1
+                # Only log if the 20% interval has passed or it's the start/end
+                if int(percent / 20) > int(self._last_logged_upload_percent / 20) or percent == 100:
+                    logging.info(f"Upload progress: {percent:.1f}%")
+                    self._last_logged_upload_percent = percent
+        except Exception as e:
+            logging.debug(f"Upload progress logging error: {e}")
+
+    async def _process_queue(self):
+        """Process items from database queue"""
+        try:
+            queued = self.db.get_queued_items()
+            logging.info(f"Processing {len(queued)} queued items from DB")
+            for item in queued:
+                # Check if item is already completed (might happen if DB state is behind)
+                if not self.db.is_completed(item['content']):
+                    # Check if item is already active in memory or aria2
+                    is_active = False
+                    for active_dl in self.active_downloads.values():
+                        if active_dl['title'] == item['title'] or active_dl['content'] == item['content']:
+                            is_active = True
+                            break
+                    if not is_active:
+                         await self.download_queue.put((item['content'], item['title']))
+                    else:
+                        logging.info(f"Skipping DB queued item '{item['title']}' - already active.")
+                else:
+                    logging.info(f"Skipping DB queued item '{item['title']}' - already completed.")
+        except Exception as e:
+            logging.error(f"Error processing queue from DB: {e}")
+
+    async def _recover_active(self):
+        """Recover active downloads on restart"""
+        try:
+            self.db.cleanup_stale_active()
+            active = self.db.get_active_downloads()
+            logging.info(f"Recovering {len(active)} active downloads from DB")
+            for item in active:
+                try:
+                    if not self.aria2:
+                        logging.warning(f"Aria2 not available, cannot recover active download {item['title']}. Re-adding to queue.")
+                        await self.download_queue.put((item['content'], item['title']))
+                        self.db.active.delete_one({"gid": item['gid']}) # Remove from active as it couldn't be recovered
+                        continue
+
+                    download = self.aria2.get_download(item['gid'])
+                    if download.is_complete:
+                        logging.info(f"Found completed download in aria2: {item['title']}, attempting upload.")
+                        await self._upload_file(download)
+                    elif download.is_active:
+                        self.active_downloads[download.gid] = {
+                            'title': item['title'],
+                            'start_time': item['started_at'].timestamp() if 'started_at' in item else time.time()
+                        }
+                        logging.info(f"Recovered active download: {item['title']} (GID: {download.gid})")
+                    elif download.status in ["paused", "waiting"]:
+                        logging.info(f"Found {download.status} download in aria2: {item['title']}, resuming.")
+                        download.resume()
+                        self.active_downloads[download.gid] = {
+                            'title': item['title'],
+                            'start_time': item['started_at'].timestamp() if 'started_at' in item else time.time()
+                        }
+                    else:
+                        logging.info(f"Download {item['title']} (GID: {item['gid']}) is in unexpected state '{download.status}' or not active. Removing from active DB.")
+                        self.db.active.delete_one({"gid": item['gid']})
+
+                except aria2p.ClientException as e:
+                    if "not found" in str(e).lower():
+                        logging.info(f"GID {item['gid']} not found in aria2. Re-adding '{item['title']}' to queue for re-download.")
+                        self.db.active.delete_one({"gid": item['gid']})
+                        await self.download_queue.put((item['content'], item['title']))
+                    else:
+                        logging.error(f"Aria2 Client error recovering download {item['gid']}: {e}")
+                except Exception as e:
+                    logging.error(f"Error recovering download {item['gid']}: {e}")
+        except Exception as e:
+            logging.error(f"Error during overall active downloads recovery: {e}")
+
     async def _download_worker(self):
-        """Process download queue"""
+        """Worker to process download queue"""
         while self.running:
             try:
-                content, title = await asyncio.wait_for(
-                    self.download_queue.get(), 
-                    timeout=5.0
-                )
+                try:
+                    content, title = await asyncio.wait_for(
+                        self.download_queue.get(), timeout=5.0
+                    )
+                except asyncio.TimeoutError:
+                    await asyncio.sleep(1)
+                    continue
                 
-                await self._add_torrent_to_session(content, title)
-                self.download_queue.task_done()
+                # Double-check completion/active status to prevent redundant downloads
+                if self.db.is_completed(content):
+                    logging.info(f"Skipping download '{title}' - already completed.")
+                    self.download_queue.task_done()
+                    continue
                 
-            except asyncio.TimeoutError:
-                continue
+                is_already_active = False
+                for active_dl in self.active_downloads.values():
+                    if active_dl['title'] == title or active_dl['content'] == content: # Check content as well
+                        is_already_active = True
+                        break
+                
+                if is_already_active:
+                    logging.info(f"Skipping download '{title}' - already active.")
+                    self.download_queue.task_done()
+                    continue
+
+                if not self.aria2:
+                    logging.error(f"Aria2 is not initialized, cannot start download: {title}. Requeuing and pausing.")
+                    await self.download_queue.put((content, title)) # Re-add to queue
+                    self.download_queue.task_done()
+                    await self.send_message(
+                        self.owner_id,
+                        f"⚠️ **Aria2 Not Ready**\n"
+                        f"Download for '{title[:50]}{'...' if len(title) > 50 else ''}' is pending Aria2 availability. Check logs."
+                    )
+                    await asyncio.sleep(30) # Wait longer if Aria2 is down
+                    continue
+
+                try:
+                    logging.info(f"Attempting to add download to aria2: {title}")
+                    if content.startswith('magnet:'):
+                        download = self.aria2.add_magnet(content, {"dir": str(DOWNLOAD_DIR)})
+                    else:
+                        download = self.aria2.add_uri([content], {"dir": str(DOWNLOAD_DIR)})
+                    
+                    self.db.move_to_active(download.gid, content, title)
+                    self.active_downloads[download.gid] = {
+                        'title': title,
+                        'content': content, # Store content for easier active check
+                        'start_time': time.time()
+                    }
+                    
+                    await self.send_message(
+                        self.owner_id,
+                        f"📥 **Download Started**\n"
+                        f"📁 {title[:50]}{'...' if len(title) > 50 else ''}\n"
+                        f"🆔 GID: `{download.gid}`"
+                    )
+                    
+                    logging.info(f"Started download: {title} (GID: {download.gid})")
+                    
+                except Exception as e:
+                    logging.error(f"Download start failed for '{title}' (Content: {content}): {e}")
+                    await self.send_message(
+                        self.owner_id,
+                        f"❌ **Download Failed to Start**\n"
+                        f"📁 {title[:50]}{'...' if len(title) > 50 else ''}\n"
+                        f"🚫 Error: Check logs for details."
+                    )
+                finally:
+                    self.download_queue.task_done()
+                    
             except Exception as e:
-                logging.error(f"Download worker error: {e}")
+                logging.error(f"Download worker main loop error: {e}", exc_info=True)
                 await asyncio.sleep(5)
 
-    async def process_psa_feed(self, url):
-        """Process RSS feed"""
-        feed = fetch_feed(url)
-        for entry in feed.entries[:5]:  # Process only latest 5 entries
-            if entry.link in self.posted or not is_valid_entry(entry):
-                continue
-                
-            content, kind = download_torrent_or_link(entry)
-            if kind in ('magnet', 'torrent'):
-                await self.download_queue.put((content, entry.title))
-                self.posted.add(entry.link)
-                await asyncio.sleep(1)
-
-    async def initial_post(self):
-        """Post initial items from feed"""
-        for url in PSA_FEEDS:
-            await self.process_psa_feed(url)
-            await asyncio.sleep(2)
-
-    async def auto_post(self):
-        """Periodically check feeds"""
+    async def _monitor_downloads(self):
+        """Monitor active downloads"""
         while self.running:
             try:
-                for url in PSA_FEEDS:
-                    await self.process_psa_feed(url)
+                await asyncio.sleep(DOWNLOAD_STATUS_UPDATE_INTERVAL)
+                
+                if not self.aria2:
+                    logging.warning("Aria2 not available for monitoring. Skipping current monitoring cycle.")
                     await asyncio.sleep(5)
-                await asyncio.sleep(300)  # 5 minutes between checks
+                    continue
+
+                for gid in list(self.active_downloads.keys()): 
+                    if not self.running:
+                        break
+                    try:
+                        download = self.aria2.get_download(gid)
+                        
+                        if download.is_complete:
+                            logging.info(f"Download completed in aria2: {self.active_downloads[gid]['title']}")
+                            if await self._upload_file(download):
+                                await self.send_message(
+                                    self.owner_id,
+                                    f"✅ **Upload Complete**\n"
+                                    f"📁 {self.active_downloads[gid]['title'][:50]}{'...' if len(self.active_downloads[gid]['title']) > 50 else ''}"
+                                )
+                            if gid in self.active_downloads:
+                                del self.active_downloads[gid]
+                            
+                        elif download.status == "error":
+                            error_msg = download.error_message or "Unknown aria2 error"
+                            logging.error(f"Download failed for '{self.active_downloads[gid]['title']}' (GID: {gid}): {error_msg}")
+                            await self.send_message(
+                                self.owner_id,
+                                f"❌ **Download Failed**\n"
+                                f"📁 {self.active_downloads[gid]['title'][:50]}{'...' if len(self.active_downloads[gid]['title']) > 50 else ''}\n"
+                                f"🚫 Error: Check logs for details. (GID: {gid})"
+                            )
+                            self.db.active.delete_one({"gid": gid})
+                            if gid in self.active_downloads:
+                                del self.active_downloads[gid]
+                            
+                        elif not download.is_active and download.status not in ["paused", "waiting", "complete"]:
+                            logging.warning(f"Download '{self.active_downloads[gid]['title']}' (GID: {gid}) is in unexpected state: {download.status}. Removing from active and DB.")
+                            self.db.active.delete_one({"gid": gid})
+                            if gid in self.active_downloads:
+                                del self.active_downloads[gid]
+
+                    except aria2p.ClientException as e:
+                        if "not found" in str(e).lower():
+                            logging.info(f"Download GID {gid} not found in aria2 (likely finished/removed). Cleaning up DB.")
+                            self.db.active.delete_one({"gid": gid})
+                            if gid in self.active_downloads:
+                                del self.active_downloads[gid]
+                        else:
+                            logging.error(f"Monitor error for {gid} (aria2 client error): {e}")
+                            await self.send_message(
+                                self.owner_id,
+                                f"❌ **Aria2 Monitoring Issue**\n"
+                                f"For GID {gid}. Check logs for details."
+                            )
+                    except Exception as e:
+                        logging.error(f"Monitor error for {gid}: {e}")
+                        await self.send_message(
+                            self.owner_id,
+                            f"❌ **Monitoring Issue**\n"
+                            f"For GID {gid}. Check logs for details."
+                        )
+                        
             except Exception as e:
-                logging.error(f"Auto-post error: {e}")
-                await asyncio.sleep(60)
+                logging.error(f"Monitor loop error: {e}", exc_info=True)
+                await asyncio.sleep(30)
+
+    async def process_feed(self, url):
+        """Process RSS feed"""
+        try:
+            feed = fetch_feed(url)
+            processed = 0
+            
+            for entry in feed.entries[:5]:
+                try:
+                    if self.db.is_completed(entry.link):
+                        logging.debug(f"Skipping RSS entry '{entry.title}' - already completed.")
+                        continue
+                    
+                    content, link_type = download_torrent_or_link(entry)
+                    if content and content != entry.link:
+                        queued_items = self.db.get_queued_items()
+                        active_items = self.db.get_active_downloads()
+                        
+                        # Check against actual content if available, else title
+                        already_queued = any(item['content'] == content or item['title'] == entry.title for item in queued_items)
+                        already_active = any(item['content'] == content or item['title'] == entry.title for item in active_items)
+
+                        if already_queued or already_active:
+                            logging.info(f"Skipping RSS entry '{entry.title}' - already queued or active.")
+                            continue
+
+                        self.db.add_to_queue(content, entry.title)
+                        await self.download_queue.put((content, entry.title))
+                        processed += 1
+                        logging.info(f"Added '{entry.title}' to download queue.")
+                        await asyncio.sleep(1)
+                        
+                except Exception as e:
+                    logging.error(f"Error processing RSS entry '{entry.title}': {e}")
+                    
+            if processed > 0:
+                logging.info(f"Added {processed} new downloads from feed: {url}")
+                
+        except Exception as e:
+            logging.error(f"Error processing feed {url}: {e}")
+
+    @Client.on_message(filters.command("clear") & filters.user(OWNER.ID))
+    async def clear_db_command(self, client, message):
+        """
+        Handles the /clear command to delete all data from MongoDB collections.
+        Only accessible by the owner.
+        """
+        logging.info(f"Owner {message.from_user.id} requested /clear command.")
+
+        confirm_message = await message.reply_text(
+            "⚠️ **WARNING:** This will delete ALL data from the database (completed, queue, active downloads).\n"
+            "Are you sure you want to proceed? Type `yes` to confirm."
+        )
+
+        try:
+            response_message = await client.wait_for_message(
+                chat_id=message.chat.id,
+                filters=filters.text & filters.user(message.from_user.id),
+                timeout=30
+            )
+
+            if response_message and response_message.text.lower() == "yes":
+                try:
+                    if self.aria2:
+                        active_downloads = self.aria2.get_downloads()
+                        for dl in active_downloads:
+                            if dl.is_active or dl.is_paused or dl.is_waiting:
+                                try:
+                                    dl.remove(force=True)
+                                    logging.info(f"Removed active download from Aria2: {dl.name} (GID: {dl.gid}) during clear.")
+                                except Exception as e:
+                                    logging.warning(f"Could not remove download {dl.gid} from Aria2 during clear: {e}")
+                    
+                    self.db.completed.delete_many({})
+                    self.db.queue.delete_many({})
+                    self.db.active.delete_many({})
+                    self.active_downloads.clear()
+
+                    while not self.download_queue.empty():
+                        try:
+                            self.download_queue.get_nowait()
+                            self.download_queue.task_done()
+                        except asyncio.QueueEmpty:
+                            break
+
+                    await message.reply_text("✅ All data has been successfully cleared from the database and active downloads removed from Aria2.")
+                    logging.info("Database and active downloads cleared successfully.")
+
+                except Exception as e:
+                    logging.error(f"An error occurred while clearing the database: {e}", exc_info=True)
+                    await message.reply_text("❌ An error occurred while clearing the database. Check logs for details.")
+            else:
+                await message.reply_text("🚫 Database clear cancelled.")
+
+        except asyncio.TimeoutError:
+            await confirm_message.edit_text("🚫 Database clear request timed out. Please try again.")
+        except Exception as e:
+            logging.error(f"An unexpected error occurred in /clear command handler: {e}", exc_info=True)
+            await message.reply_text("❌ An unexpected error occurred during clear confirmation. Check logs for details.")
+
+    @Client.on_message(filters.command("restart") & filters.user(OWNER.ID))
+    async def restart_command(self, client, message):
+        """
+        Handles the /restart command to gracefully restart the bot.
+        Only accessible by the owner.
+        """
+        logging.info(f"Owner {message.from_user.id} requested /restart command.")
+        restart_msg = await message.reply_text("🔄 **Restarting bot...** Please wait.")
+        
+        try:
+            await self.stop() 
+            logging.info("Bot has been gracefully stopped. Preparing for restart...")
+
+            python = sys.executable
+            os.execl(python, python, *sys.argv)
+            
+        except Exception as e:
+            logging.error(f"Failed to restart bot: {e}", exc_info=True)
+            await restart_msg.edit_text(f"❌ **Restart failed.** Check logs for details.")
 
     async def start(self):
         """Start the bot"""
         await super().start()
         self.running = True
         
-        # Start aria2
         self.aria2_process, self.aria2 = await start_aria2()
         if not self.aria2:
-            await self.send_message(self.owner_id, "❌ Failed to start Aria2. Downloads will not work.")
+            await self.send_message(self.owner_id, "❌ Failed to start Aria2 daemon. Some functions (downloads) will not work. Check Koyeb logs for details.")
         
-        # Initialize thumbnail
-        self.thumbnail_path = await download_thumbnail() or create_default_thumbnail()
+        self.thumbnail_path = await get_thumbnail()
         
-        # Start background tasks
-        asyncio.create_task(keep_alive())
-        asyncio.create_task(self._update_download_progress())
+        await self._process_queue()
+        await self._recover_active()
+        
         asyncio.create_task(self._download_worker())
-        asyncio.create_task(self.auto_post())
+        asyncio.create_task(self._monitor_downloads())
+        asyncio.create_task(self._feed_loop())
         
-        # Initial setup
-        await self.initial_post()
-        me = await self.get_me()
         await self.send_message(
-            self.owner_id,
-            f"✅ **Bot Started**\n\n"
-            f"• Username: @{me.username}\n"
-            f"• Aria2: {'✅' if self.aria2 else '❌'}\n"
-            f"• Queue: {self.download_queue.qsize()} items"
+            self.owner_id, 
+            f"✅ **Bot Started Successfully**\n\n"
+            f"🔧 Features:\n"
+            f"• MongoDB persistence\n"
+            f"• Thumbnail support\n"
+            f"• Auto-recovery\n"
+            f"• RSS monitoring\n"
+            f"• `/clear` command for database management\n"
+            f"• `/restart` command for bot reloads\n\n"
+            f"📊 Status:\n"
+            f"• Active downloads: {len(self.active_downloads)}\n"
+            f"• Queue size: {self.download_queue.qsize()}"
         )
 
-    async def stop(self, *args):
+    async def stop(self):
         """Stop the bot"""
         logging.info("Stopping bot...")
         self.running = False
-        
-        # Stop aria2
+        # Give a short moment for tasks to recognize `self.running = False`
+        await asyncio.sleep(2) 
+
         if self.aria2_process:
+            logging.info("Terminating aria2 process...")
             try:
                 self.aria2_process.terminate()
-                await asyncio.sleep(2)
-                if self.aria2_process.poll() is None:
-                    self.aria2_process.kill()
+                self.aria2_process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                logging.warning("Aria2 process did not terminate gracefully, killing it.")
+                self.aria2_process.kill()
             except Exception as e:
-                logging.error(f"Error stopping aria2: {e}")
+                logging.error(f"Error terminating aria2 process: {e}")
         
-        await super().stop()
-        logging.info("Bot stopped")
+        await super().stop() 
+        logging.info("Bot stopped.")
+
+    async def _feed_loop(self):
+        """Main feed processing loop"""
+        while self.running:
+            try:
+                logging.info("Starting new RSS feed processing cycle.")
+                for url in PSA_FEEDS:
+                    if not self.running:
+                        break
+                    await self.process_feed(url)
+                    await asyncio.sleep(2)
+                    
+                for _ in range(600):
+                    if not self.running:
+                        break
+                    await asyncio.sleep(1)
+                    
+            except Exception as e:
+                logging.error(f"Feed loop error: {e}", exc_info=True)
+                await asyncio.sleep(60)
 
 # ------------------ Main ------------------
 async def main():
+    """Main async function"""
     flask_thread = threading.Thread(target=run_flask, daemon=True)
     flask_thread.start()
     
-    bot = MN_Bot()
+    bot = TorrentBot()
+    
     try:
         await bot.start()
+        logging.info("Bot started, waiting for events...")
         await idle()
+        
     except KeyboardInterrupt:
-        logging.info("Bot stopped by user")
+        logging.info("Bot stopped by user via KeyboardInterrupt")
     except Exception as e:
-        logging.critical(f"Bot crashed: {e}")
+        logging.critical(f"Bot crashed in main function: {e}", exc_info=True)
+        sys.exit(1)
     finally:
-        await bot.stop()
+        try:
+            await bot.stop()
+        except Exception as e:
+            logging.critical(f"Error during bot stop in final block: {e}", exc_info=True)
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        pass
+        logging.info("Program interrupted by user (main process)")
     except Exception as e:
-        logging.critical(f"Fatal error: {e}")
+        logging.critical(f"Program crashed at top level: {e}", exc_info=True)
+        sys.exit(1)
