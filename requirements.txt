@@ -14,5 +14,5 @@ certifi
 urllib3
 setuptools
 Pillow
-aria2p>=0.11.0
+qbittorrent-api
 pymongo
