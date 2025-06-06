@@ -21,7 +21,7 @@ KEEP_ALIVE_URL = "https://abundant-barbie-musammiln-db578527.koyeb.app/"  # Opti
 MONGODB_URI = "mongodb+srv://mntgx:mntgx@cluster0.pzcpq.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0"
 MAX_FILE_SIZE_MB = 1900  # Telegram limit (adjust as needed)
 DOWNLOAD_STATUS_UPDATE_INTERVAL = 10
-TELEGRAM_FILENAME_LIMIT = 60
+TELEGRAM_FILENAME_LIMIT = 64
 SUFFIX = " -@VideoDLBot.-"
 THUMBNAIL_URL = "https://i.ibb.co/MDwd1f3D/6087047735061627461.jpg"  # Replace with your thumbnail URL
 
