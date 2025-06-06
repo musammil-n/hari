@@ -7,6 +7,7 @@ import re
 import subprocess
 import sys
 import time
+import threading  # MISSING IMPORT - Added this
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
@@ -97,18 +98,66 @@ def home():
 def run_flask():
     app.run(host='0.0.0.0', port=8000)
 
+# ------------------ Missing Functions ------------------
+def fetch_feed(url):
+    """Fetch RSS feed"""
+    try:
+        feed = feedparser.parse(url)
+        logging.info(f"Fetched {len(feed.entries)} entries from {url}")
+        return feed
+    except Exception as e:
+        logging.error(f"Failed to fetch feed {url}: {e}")
+        return feedparser.FeedParserDict()
+
+def download_torrent_or_link(entry):
+    """Extract torrent/magnet link from RSS entry"""
+    try:
+        # Check for magnet link in entry
+        if hasattr(entry, 'link') and entry.link.startswith('magnet:'):
+            return entry.link, 'magnet'
+        
+        # Check for torrent file in enclosures
+        if hasattr(entry, 'enclosures'):
+            for enclosure in entry.enclosures:
+                if enclosure.type == 'application/x-bittorrent':
+                    return enclosure.href, 'torrent'
+        
+        # Check for links in entry content
+        if hasattr(entry, 'links'):
+            for link in entry.links:
+                if link.type == 'application/x-bittorrent':
+                    return link.href, 'torrent'
+                elif 'magnet:' in link.href:
+                    return link.href, 'magnet'
+        
+        # Fallback to entry link
+        return entry.link, 'link'
+        
+    except Exception as e:
+        logging.error(f"Failed to extract torrent link: {e}")
+        return entry.link, 'link'
+
 # ------------------ Aria2 Setup ------------------
 def start_aria2():
     try:
+        # Kill any existing aria2 processes
+        try:
+            subprocess.run(["pkill", "-f", "aria2c"], check=False)
+            time.sleep(2)
+        except:
+            pass
+            
         return subprocess.Popen([
             "aria2c",
             "--enable-rpc",
             "--rpc-listen-all",
+            "--rpc-listen-port=6800",
             f"--dir={DOWNLOAD_DIR}",
             "--max-concurrent-downloads=1",
             "--bt-max-peers=30",
             "--seed-time=0",
-            "--quiet"
+            "--quiet",
+            "--daemon"
         ])
     except Exception as e:
         logging.error(f"Failed to start aria2: {e}")
@@ -223,31 +272,39 @@ class TorrentBot(Client):
 
     async def _process_queue(self):
         """Process items from database queue"""
-        queued = await self.db.get_queued_items()
-        for item in queued:
-            await self.download_queue.put((item['content'], item['title']))
+        try:
+            queued = await self.db.get_queued_items()
+            for item in queued:
+                await self.download_queue.put((item['content'], item['title']))
+        except Exception as e:
+            logging.error(f"Error processing queue: {e}")
 
     async def _recover_active(self):
         """Recover active downloads on restart"""
-        active = await self.db.get_active_downloads()
-        for item in active:
-            try:
-                download = self.aria2.get_download(item['gid'])
-                if download.is_complete:
-                    await self._upload_file(download)
-                elif not download.is_removed:
-                    self.active_downloads[download.gid] = {
-                        'title': item['title'],
-                        'start_time': item['started_at'].timestamp()
-                    }
-            except:
-                pass
+        try:
+            active = await self.db.get_active_downloads()
+            for item in active:
+                try:
+                    download = self.aria2.get_download(item['gid'])
+                    if download.is_complete:
+                        await self._upload_file(download)
+                    elif not download.is_removed:
+                        self.active_downloads[download.gid] = {
+                            'title': item['title'],
+                            'start_time': item['started_at'].timestamp()
+                        }
+                except Exception as e:
+                    logging.error(f"Error recovering download {item['gid']}: {e}")
+        except Exception as e:
+            logging.error(f"Error recovering active downloads: {e}")
 
     async def _download_worker(self):
         while True:
-            content, title = await self.download_queue.get()
             try:
+                content, title = await self.download_queue.get()
+                
                 if await self.db.is_completed(content):
+                    self.download_queue.task_done()
                     continue
                     
                 if content.startswith('magnet:'):
@@ -269,52 +326,72 @@ class TorrentBot(Client):
                 
             except Exception as e:
                 logging.error(f"Download failed: {title} - {e}")
-                await self.send_message(
-                    self.owner_id,
-                    f"❌ Download failed: {title}\nError: {e}"
-                )
+                try:
+                    await self.send_message(
+                        self.owner_id,
+                        f"❌ Download failed: {title}\nError: {e}"
+                    )
+                except:
+                    pass
             finally:
                 self.download_queue.task_done()
 
     async def _monitor_downloads(self):
         while True:
-            await asyncio.sleep(DOWNLOAD_STATUS_UPDATE_INTERVAL)
-            for gid, data in list(self.active_downloads.items()):
-                try:
-                    download = self.aria2.get_download(gid)
-                    
-                    if download.is_complete:
-                        if await self._upload_file(download):
+            try:
+                await asyncio.sleep(DOWNLOAD_STATUS_UPDATE_INTERVAL)
+                for gid, data in list(self.active_downloads.items()):
+                    try:
+                        download = self.aria2.get_download(gid)
+                        
+                        if download.is_complete:
+                            if await self._upload_file(download):
+                                await self.send_message(
+                                    self.owner_id,
+                                    f"✅ Completed: {data['title']}"
+                                )
+                            del self.active_downloads[gid]
+                            
+                        elif download.error_message:
                             await self.send_message(
                                 self.owner_id,
-                                f"✅ Completed: {data['title']}"
+                                f"❌ Failed: {data['title']}\nError: {download.error_message}"
                             )
-                        del self.active_downloads[gid]
-                        
-                    elif download.error_message:
-                        await self.send_message(
-                            self.owner_id,
-                            f"❌ Failed: {data['title']}\nError: {download.error_message}"
-                        )
-                        del self.active_downloads[gid]
-                        
-                except Exception as e:
-                    logging.error(f"Monitor error: {e}")
+                            del self.active_downloads[gid]
+                            
+                    except Exception as e:
+                        logging.error(f"Monitor error for {gid}: {e}")
+            except Exception as e:
+                logging.error(f"Monitor loop error: {e}")
+                await asyncio.sleep(30)
 
     async def process_feed(self, url):
-        feed = fetch_feed(url)
-        for entry in feed.entries[:3]:  # Only process 3 newest
-            if await self.db.is_completed(entry.link):
-                continue
-                
-            content, _ = download_torrent_or_link(entry)
-            await self.db.add_to_queue(content, entry.title)
-            await self.download_queue.put((content, entry.title))
-            await asyncio.sleep(1)
+        try:
+            feed = fetch_feed(url)
+            for entry in feed.entries[:3]:  # Only process 3 newest
+                if await self.db.is_completed(entry.link):
+                    continue
+                    
+                content, _ = download_torrent_or_link(entry)
+                await self.db.add_to_queue(content, entry.title)
+                await self.download_queue.put((content, entry.title))
+                await asyncio.sleep(1)
+        except Exception as e:
+            logging.error(f"Error processing feed {url}: {e}")
 
     async def start(self):
         await super().start()
-        self.aria2 = aria2p.API(aria2p.Client())
+        
+        # Wait for aria2 to be ready
+        await asyncio.sleep(5)
+        
+        try:
+            self.aria2 = aria2p.API(aria2p.Client(host="http://localhost", port=6800, secret=""))
+        except Exception as e:
+            logging.error(f"Failed to connect to aria2: {e}")
+            await self.send_message(self.owner_id, f"❌ Failed to connect to aria2: {e}")
+            return
+            
         self.thumbnail_path = await get_thumbnail()
         
         # Recover state
@@ -322,6 +399,7 @@ class TorrentBot(Client):
         await self._recover_active()
         
         # Start background tasks
+        asyncio.create_task(self._download_worker())
         asyncio.create_task(self._monitor_downloads())
         asyncio.create_task(self._feed_loop())
         
@@ -337,22 +415,32 @@ class TorrentBot(Client):
                     await self.process_feed(url)
                 await asyncio.sleep(600)  # Check every 10 minutes
             except Exception as e:
-                logging.error(f"Feed error: {e}")
+                logging.error(f"Feed loop error: {e}")
                 await asyncio.sleep(60)
 
 # ------------------ Main ------------------
 if __name__ == "__main__":
-    # Start services
+    # Start aria2
     aria_process = start_aria2()
     if not aria_process:
+        logging.error("Failed to start aria2")
         sys.exit(1)
-        
+    
+    # Give aria2 time to start
+    time.sleep(3)
+    
+    # Start Flask in background
     threading.Thread(target=run_flask, daemon=True).start()
     
     # Run bot
     bot = TorrentBot()
     try:
-        bot.run()
+        asyncio.run(bot.run())
+    except KeyboardInterrupt:
+        logging.info("Bot stopped by user")
+    except Exception as e:
+        logging.error(f"Bot crashed: {e}")
     finally:
         if aria_process:
             aria_process.terminate()
+            aria_process.wait()
