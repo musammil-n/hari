@@ -2,23 +2,24 @@ import asyncio
 import logging
 import os
 import re
+import ssl
 import threading
-from datetime import datetime
 from pathlib import Path
-from typing import Optional, List, Dict
-from flask import Flask
+from typing import Dict, List
+
 import aiohttp
+import certifi
 import feedparser
 from bs4 import BeautifulSoup
-from PIL import Image
+from flask import Flask
 from pymongo import MongoClient
-from pyrogram import Client, filters, idle
+from pyrogram import Client, idle
 from config import BOT, API, OWNER
 
 # ------------------ Constants ------------------
 DOWNLOAD_DIR = Path(__file__).parent / "downloads"
-THUMBNAIL_URL = "https://i.ibb.co/MDwd1f3D/6087047735061627461.jpg"  # Default thumbnail
-SUFFIX = " -@ClassicCinema.-"
+THUMBNAIL_URL = "https://i.ibb.co/MDwd1f3D/6087047735061627461.jpg"
+SUFFIX = " -@MNTGX.-"
 MAX_FILE_SIZE_MB = 1900
 MONGODB_URI = "mongodb+srv://mntgx:mntgx@cluster0.pzcpq.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0"
 
@@ -29,10 +30,14 @@ ARCHIVE_ORG_FEEDS = [
 CLASSIC_CINEMA_URL = "https://www.classiccinemaonline.com/movies/"
 
 # ------------------ Flask ------------------
-app = Flask(__name__)
-@app.route('/')
-def home(): return "Classic Cinema Bot is running!"
-def run_flask(): app.run(host='0.0.0.0', port=8000)
+flask_app = Flask(__name__)
+
+@flask_app.route('/')
+def home():
+    return "Classic Cinema Bot is running!"
+
+def run_flask():
+    flask_app.run(host='0.0.0.0', port=8000)
 
 # ------------------ MongoDB ------------------
 class MongoDB:
@@ -40,39 +45,46 @@ class MongoDB:
         self.client = MongoClient(MONGODB_URI)
         self.db = self.client.classic_cinema_bot
         self.completed = self.db.completed
-    def is_completed(self, content): return bool(self.completed.find_one({"content": content}))
-    def mark_completed(self, content): self.completed.insert_one({"content": content})
+    
+    def is_completed(self, content):
+        return bool(self.completed.find_one({"content": content}))
+    
+    def mark_completed(self, content):
+        self.completed.insert_one({"content": content})
 
 # ------------------ Utilities ------------------
 def sanitize_filename(filename: str) -> str:
-    """Remove special characters from filename"""
     return re.sub(r'[\\/*?:"<>|]', "", filename)
 
+async def create_ssl_context():
+    ssl_context = ssl.create_default_context(cafile=certifi.where())
+    ssl_context.check_hostname = False  # Disable hostname verification
+    ssl_context.verify_mode = ssl.CERT_NONE  # Disable certificate verification
+    return ssl_context
+
 async def download_file(url: str, save_path: Path) -> bool:
-    """Download file with aiohttp"""
-    async with aiohttp.ClientSession() as session:
+    ssl_context = await create_ssl_context()
+    connector = aiohttp.TCPConnector(ssl=ssl_context)
+    
+    async with aiohttp.ClientSession(connector=connector) as session:
         async with session.get(url) as response:
             if response.status == 200:
                 with open(save_path, 'wb') as f:
-                    while True:
-                        chunk = await response.content.read(1024)
-                        if not chunk:
-                            break
+                    async for chunk in response.content.iter_chunked(1024):
                         f.write(chunk)
                 return True
     return False
 
 async def get_movie_metadata(title: str) -> Dict:
-    """Get basic metadata for caption"""
+    year_match = re.search(r'(19\d{2}|20\d{2})', title)
     return {
         "title": title,
-        "year": re.search(r'(19\d{2}|20\d{2})', title).group(1) if re.search(r'(19\d{2}|20\d{2})', title) else "N/A",
+        "year": year_match.group(1) if year_match else "N/A",
         "source": "Archive.org" if "archive.org" in title.lower() else "ClassicCinemaOnline"
     }
 
 # ------------------ Scrapers ------------------
 async def scrape_archive_org() -> List[Dict]:
-    """Get movies from Archive.org RSS"""
     movies = []
     for feed_url in ARCHIVE_ORG_FEEDS:
         feed = feedparser.parse(feed_url)
@@ -86,52 +98,66 @@ async def scrape_archive_org() -> List[Dict]:
     return movies
 
 async def scrape_classic_cinema() -> List[Dict]:
-    """Scrape ClassicCinemaOnline.com"""
     movies = []
-    async with aiohttp.ClientSession() as session:
-        async with session.get(CLASSIC_CINEMA_URL) as response:
-            if response.status == 200:
-                soup = BeautifulSoup(await response.text(), 'html.parser')
-                for movie_div in soup.find_all('div', class_='movie-item'):
-                    title = movie_div.find('h3').text.strip()
-                    page_url = movie_div.find('a')['href']
-                    if not db.is_completed(page_url):
-                        # Need to visit individual page to find download link
-                        async with session.get(page_url) as movie_page:
-                            if movie_page.status == 200:
-                                movie_soup = BeautifulSoup(await movie_page.text(), 'html.parser')
-                                if download_div := movie_soup.find('div', class_='download-link'):
-                                    movies.append({
-                                        "title": title,
-                                        "url": page_url,
-                                        "download_url": download_div.find('a')['href']
-                                    })
+    ssl_context = await create_ssl_context()
+    connector = aiohttp.TCPConnector(ssl=ssl_context)
+    
+    try:
+        async with aiohttp.ClientSession(connector=connector) as session:
+            async with session.get(CLASSIC_CINEMA_URL) as response:
+                if response.status == 200:
+                    soup = BeautifulSoup(await response.text(), 'html.parser')
+                    for movie_div in soup.find_all('div', class_='movie-item'):
+                        title = movie_div.find('h3').text.strip()
+                        page_url = movie_div.find('a')['href']
+                        if not db.is_completed(page_url):
+                            async with session.get(page_url) as movie_page:
+                                if movie_page.status == 200:
+                                    movie_soup = BeautifulSoup(await movie_page.text(), 'html.parser')
+                                    if download_div := movie_soup.find('div', class_='download-link'):
+                                        movies.append({
+                                            "title": title,
+                                            "url": page_url,
+                                            "download_url": download_div.find('a')['href']
+                                        })
+    except Exception as e:
+        logging.error(f"Error scraping classic cinema: {e}")
     return movies
 
 # ------------------ Bot ------------------
 class ClassicCinemaBot(Client):
     def __init__(self):
-        super().__init__("ClassicCinemaBot", api_id=API.ID, api_hash=API.HASH, bot_token=BOT.TOKEN)
+        super().__init__(
+            "ClassicCinemaBot",
+            api_id=Config.API.ID,
+            api_hash=Config.API.HASH,
+            bot_token=Config.BOT.TOKEN
+        )
         self.db = MongoDB()
         self.thumbnail_path = None
-        self.download_queue = asyncio.Queue()
 
     async def start(self):
         await super().start()
         self.thumbnail_path = await self.download_thumbnail()
         threading.Thread(target=run_flask, daemon=True).start()
         asyncio.create_task(self.scrape_and_process_loop())
-        await self.send_message(OWNER.ID, "✅ Classic Cinema Bot Started!")
+        await self.send_message(Config.OWNER.ID, "✅ Classic Cinema Bot Started!")
 
     async def download_thumbnail(self):
         path = Path("thumbnail.jpg")
-        if path.exists(): return path
+        if path.exists():
+            return path
+        
+        ssl_context = await create_ssl_context()
+        connector = aiohttp.TCPConnector(ssl=ssl_context)
+        
         try:
-            async with aiohttp.ClientSession() as session:
+            async with aiohttp.ClientSession(connector=connector) as session:
                 async with session.get(THUMBNAIL_URL) as response:
                     if response.status == 200:
                         with open(path, "wb") as f:
-                            f.write(await response.read())
+                            async for chunk in response.content.iter_chunked(1024):
+                                f.write(chunk)
                         return path
         except Exception as e:
             logging.error(f"Failed to download thumbnail: {e}")
@@ -140,7 +166,6 @@ class ClassicCinemaBot(Client):
     async def scrape_and_process_loop(self):
         while True:
             try:
-                # Get movies from both sources
                 archive_movies = await scrape_archive_org()
                 classic_movies = await scrape_classic_cinema()
                 all_movies = archive_movies + classic_movies
@@ -148,64 +173,51 @@ class ClassicCinemaBot(Client):
                 for movie in all_movies:
                     if not self.db.is_completed(movie['url']):
                         await self.process_movie(movie)
-                        await asyncio.sleep(10)  # Rate limiting
+                        await asyncio.sleep(10)
 
             except Exception as e:
                 logging.error(f"Error in scrape loop: {e}")
-                await self.send_message(OWNER.ID, f"❌ Scrape Error: {str(e)}")
+                await self.send_message(Config.OWNER.ID, f"❌ Scrape Error: {str(e)}")
 
-            await asyncio.sleep(3600)  # Check every hour
+            await asyncio.sleep(3600)
 
     async def process_movie(self, movie: Dict):
-        """Download and send a movie"""
         try:
-            # Create download directory if not exists
             os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-            
-            # Generate filename
             clean_title = sanitize_filename(movie['title'])
             file_ext = Path(movie['download_url']).suffix or '.mp4'
             filename = f"{clean_title[:50]}{SUFFIX}{file_ext}"
             save_path = DOWNLOAD_DIR / filename
 
-            # Download the file
-            await self.send_message(OWNER.ID, f"⬇️ Downloading: {movie['title']}")
+            await self.send_message(Config.OWNER.ID, f"⬇️ Downloading: {movie['title']}")
             success = await download_file(movie['download_url'], save_path)
             
             if success:
-                # Get metadata for caption
                 metadata = await get_movie_metadata(movie['title'])
-                caption = (
-                    f"🎬 {metadata['title']}\n"
-                    f"📅 Year: {metadata['year']}\n"
-                    f"🏷️ Source: {metadata['source']}"
-                )
+                caption = f"🎬 {metadata['title']}\n📅 Year: {metadata['year']}\n🏷️ Source: {metadata['source']}"
 
-                # Check file size
-                file_size = save_path.stat().st_size / (1024 * 1024)  # MB
+                file_size = save_path.stat().st_size / (1024 * 1024)
                 if file_size > MAX_FILE_SIZE_MB:
-                    await self.send_message(OWNER.ID, f"❌ File too big ({file_size:.2f}MB): {filename}")
+                    await self.send_message(Config.OWNER.ID, f"❌ File too big ({file_size:.2f}MB): {filename}")
                     save_path.unlink()
                     return
 
-                # Send to Telegram
                 await self.send_document(
-                    chat_id=OWNER.ID,
+                    chat_id=Config.OWNER.ID,
                     document=str(save_path),
                     caption=caption,
                     thumb=str(self.thumbnail_path) if self.thumbnail_path else None
                 )
 
-                # Clean up and mark complete
                 save_path.unlink()
                 self.db.mark_completed(movie['url'])
-                await self.send_message(OWNER.ID, f"✅ Successfully sent: {movie['title']}")
+                await self.send_message(Config.OWNER.ID, f"✅ Successfully sent: {movie['title']}")
 
             else:
-                await self.send_message(OWNER.ID, f"❌ Failed to download: {movie['title']}")
+                await self.send_message(Config.OWNER.ID, f"❌ Failed to download: {movie['title']}")
 
         except Exception as e:
-            await self.send_message(OWNER.ID, f"❌ Error processing {movie['title']}: {str(e)}")
+            await self.send_message(Config.OWNER.ID, f"❌ Error processing {movie['title']}: {str(e)}")
             logging.error(f"Error processing movie: {e}")
 
 # ------------------ Main ------------------
