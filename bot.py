@@ -17,8 +17,8 @@ import aria2p
 from flask import Flask
 from PIL import Image
 from pymongo import MongoClient
-from pyrogram import Client, errors, idle
-from config import BOT, API, OWNER # Assuming config.py exists with these details
+from pyrogram import Client, filters, idle, errors
+from config import BOT, API, OWNER
 
 # ------------------ Constants ------------------
 KEEP_ALIVE_URL = "https://abundant-barbie-musammiln-db578527.koyeb.app/"
@@ -143,7 +143,7 @@ def run_flask():
     except Exception as e:
         logging.error(f"Flask server error: {e}")
 
-# ------------------ Missing Functions (from previous context, already included) ------------------
+# ------------------ Missing Functions ------------------
 def fetch_feed(url):
     """Fetch RSS feed"""
     try:
@@ -178,7 +178,7 @@ def download_torrent_or_link(entry):
         logging.error(f"Failed to extract torrent link: {e}")
         return entry.link, 'link'
 
-# ------------------ Aria2 Setup (with improvements from previous response) ------------------
+# ------------------ Aria2 Setup (with improvements) ------------------
 async def start_aria2():
     """Start aria2 daemon"""
     process = None
@@ -196,7 +196,6 @@ async def start_aria2():
             logging.warning("killall command not found. Cannot explicitly kill existing aria2 processes.")
             # Fallback for environments without 'killall'
             try:
-                # This is a less robust way but might work if 'ps' and 'grep' are available
                 output = subprocess.check_output(["ps", "aux"]).decode()
                 for line in output.splitlines():
                     if "aria2c" in line and "grep" not in line:
@@ -395,7 +394,7 @@ class TorrentBot(Client):
             
             logging.info(f"Attempting to upload {file_path.name} to Telegram (Chat ID: {self.owner_id})...")
             await self.send_document(
-                chat_id=self.owner_id, # This is where the file is uploaded
+                chat_id=self.owner_id,
                 document=str(file_path),
                 caption=caption,
                 thumb=str(self.thumbnail_path) if self.thumbnail_path else None,
@@ -589,7 +588,7 @@ class TorrentBot(Client):
                         
                         if download.is_complete:
                             logging.info(f"Download completed in aria2: {self.active_downloads[gid]['title']}")
-                            if await self._upload_file(download): # This is the auto-upload trigger
+                            if await self._upload_file(download):
                                 await self.send_message(
                                     self.owner_id,
                                     f"✅ **Upload Complete**\n"
@@ -668,6 +667,96 @@ class TorrentBot(Client):
         except Exception as e:
             logging.error(f"Error processing feed {url}: {e}")
 
+    @Client.on_message(filters.command("clear") & filters.user(OWNER.ID))
+    async def clear_db_command(self, client, message):
+        """
+        Handles the /clear command to delete all data from MongoDB collections.
+        Only accessible by the owner.
+        """
+        logging.info(f"Owner {message.from_user.id} requested /clear command.")
+
+        # Ask for confirmation
+        confirm_message = await message.reply_text(
+            "⚠️ **WARNING:** This will delete ALL data from the database (completed, queue, active downloads).\n"
+            "Are you sure you want to proceed? Type `yes` to confirm."
+        )
+
+        try:
+            # Wait for a confirmation message from the same user
+            response_message = await client.wait_for_message(
+                chat_id=message.chat.id,
+                filters=filters.text & filters.user(message.from_user.id),
+                timeout=30 # Wait for 30 seconds
+            )
+
+            if response_message and response_message.text.lower() == "yes":
+                try:
+                    # Stop active downloads first if aria2 is running
+                    if self.aria2:
+                        active_downloads = self.aria2.get_downloads()
+                        for dl in active_downloads:
+                            if dl.is_active or dl.is_paused or dl.is_waiting:
+                                try:
+                                    dl.remove(force=True) # Force remove from aria2
+                                    logging.info(f"Removed active download from Aria2: {dl.name} (GID: {dl.gid})")
+                                except Exception as e:
+                                    logging.warning(f"Could not remove download {dl.gid} from Aria2: {e}")
+                    
+                    # Clear database collections
+                    self.db.completed.delete_many({})
+                    self.db.queue.delete_many({})
+                    self.db.active.delete_many({})
+                    self.active_downloads.clear() # Clear in-memory active downloads
+
+                    # Clear in-memory queue (if any items were added before DB persistence)
+                    while not self.download_queue.empty():
+                        try:
+                            self.download_queue.get_nowait()
+                            self.download_queue.task_done()
+                        except asyncio.QueueEmpty:
+                            break
+
+                    await message.reply_text("✅ All data has been successfully cleared from the database and active downloads removed from Aria2.")
+                    logging.info("Database and active downloads cleared successfully.")
+
+                except Exception as e:
+                    await message.reply_text(f"❌ An error occurred while clearing the database: {e}")
+                    logging.error(f"Error clearing database: {e}")
+            else:
+                await message.reply_text("🚫 Database clear cancelled.")
+
+        except asyncio.TimeoutError:
+            await confirm_message.edit_text("🚫 Database clear request timed out. Please try again.")
+        except Exception as e:
+            await message.reply_text(f"❌ An unexpected error occurred: {e}")
+            logging.error(f"Error in /clear command handler: {e}")
+
+
+    @Client.on_message(filters.command("restart") & filters.user(OWNER.ID))
+    async def restart_command(self, client, message):
+        """
+        Handles the /restart command to gracefully restart the bot.
+        Only accessible by the owner.
+        """
+        logging.info(f"Owner {message.from_user.id} requested /restart command.")
+        restart_msg = await message.reply_text("🔄 **Restarting bot...** Please wait.")
+        
+        try:
+            # Stop the bot gracefully
+            await self.stop() 
+            logging.info("Bot has been gracefully stopped. Preparing for restart...")
+
+            # Use os.execl to restart the current Python script
+            # This replaces the current process with a new one.
+            # sys.executable is the path to the Python interpreter.
+            # sys.argv are the command-line arguments.
+            python = sys.executable
+            os.execl(python, python, *sys.argv)
+            
+        except Exception as e:
+            logging.error(f"Failed to restart bot: {e}")
+            await restart_msg.edit_text(f"❌ **Restart failed:** {e}")
+
     async def start(self):
         """Start the bot"""
         await super().start()
@@ -693,7 +782,9 @@ class TorrentBot(Client):
             f"• MongoDB persistence\n"
             f"• Thumbnail support\n"
             f"• Auto-recovery\n"
-            f"• RSS monitoring\n\n"
+            f"• RSS monitoring\n"
+            f"• `/clear` command for database management\n"
+            f"• `/restart` command for bot reloads\n\n" # Added this line
             f"📊 Status:\n"
             f"• Active downloads: {len(self.active_downloads)}\n"
             f"• Queue size: {self.download_queue.qsize()}"
@@ -713,7 +804,9 @@ class TorrentBot(Client):
                 self.aria2_process.kill()
             except Exception as e:
                 logging.error(f"Error terminating aria2 process: {e}")
-        await super().stop()
+        
+        # Ensure Pyrogram client is stopped
+        await super().stop() 
         logging.info("Bot stopped.")
 
     async def _feed_loop(self):
@@ -727,7 +820,7 @@ class TorrentBot(Client):
                     await self.process_feed(url)
                     await asyncio.sleep(2)
                     
-                for _ in range(600):
+                for _ in range(600): # Sleep for 10 minutes between feed cycles
                     if not self.running:
                         break
                     await asyncio.sleep(1)
