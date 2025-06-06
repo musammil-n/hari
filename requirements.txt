@@ -15,3 +15,8 @@ urllib3
 setuptools
 Pillow
 aria2p
+pymongo
+dnspython
+humanize
+asyncio-timeout
+psutil
