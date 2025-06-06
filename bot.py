@@ -11,7 +11,7 @@ import threading
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
-
+from config import BOT, API, OWNER
 import aiohttp
 import aria2p
 from flask import Flask
