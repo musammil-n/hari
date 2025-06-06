@@ -21,7 +21,7 @@ THUMBNAIL_URL = "https://i.ibb.co/MDwd1f3D/6087047735061627461.jpg"
 SUFFIX = " -@MNTGX.-"
 MAX_FILE_SIZE_MB = 1900
 PSA_FEEDS = ["https://bt4gprx.com/search?q=psa&page=rss"]
-MONGODB_URI = "your_mongo_uri"
+MONGODB_URI = "mongodb+srv://mntgx:mntgx@cluster0.pzcpq.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0"
 
 # ------------------ Flask ------------------
 app = Flask(__name__)
