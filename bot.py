@@ -24,7 +24,7 @@ THUMBNAIL_URL = "https://i.ibb.co/MDwd1f3D/6087047735061627461.jpg"
 SUFFIX = " -@MNTGX.-"
 MAX_FILE_SIZE_MB = 1900
 MIN_FILE_SIZE_MB = 100  # Added minimum file size
-MONGODB_URI = "mongodb-srv://mntgx:mntgx@cluster0.pzcpq.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0"
+MONGODB_URI = "mongodb+srv://mntgx:mntgx@cluster0.pzcpq.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0"
 
 # Sources
 ARCHIVE_ORG_FEEDS = [
