@@ -7,6 +7,8 @@ Flask
 cloudscraper
 requests
 beautifulsoup4
+python-libtorrent
+libtorrent
 lxml
 torrent-parser
 bencodepy
