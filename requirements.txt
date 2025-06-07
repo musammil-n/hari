@@ -7,7 +7,7 @@ Flask
 cloudscraper
 requests
 beautifulsoup4
-python-libtorrent
+python-libtorrent==2.0.10
 libtorrent
 lxml
 torrent-parser
@@ -16,6 +16,5 @@ certifi
 urllib3
 setuptools
 Pillow
-qbittorrent-api
 pymongo
 certifi
